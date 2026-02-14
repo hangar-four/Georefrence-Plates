@@ -85,6 +85,7 @@ class App(tk.Tk):
         self.page_image: Optional[Image.Image] = None
         self.crop_box: Optional[Tuple[int, int, int, int]] = None
         self.display_scale: float = 1.0
+        self.zoom: float = 1.0
         self.tk_image: Optional[ImageTk.PhotoImage] = None
 
         self.click_points: List[Tuple[float, float]] = []
@@ -155,6 +156,8 @@ class App(tk.Tk):
         self.canvas.bind("<Button-1>", self.on_canvas_click)
         self.canvas.bind("<B1-Motion>", self.on_canvas_drag)
         self.canvas.bind("<ButtonRelease-1>", self.on_canvas_release)
+        self.canvas.bind("<MouseWheel>", self.on_mouse_wheel)
+        self.canvas.bind("<Configure>", lambda _e: self._draw_image())
 
         controls = ttk.Frame(self)
         controls.grid(row=2, column=0, sticky="ew", padx=10)
@@ -188,6 +191,15 @@ class App(tk.Tk):
 
         ttk.Button(controls, text="Generate KMZ", command=self.on_generate).grid(
             row=0, column=5, sticky="e"
+        )
+        ttk.Button(controls, text="Zoom +", command=self.on_zoom_in).grid(
+            row=0, column=6, sticky="e", padx=(8, 0)
+        )
+        ttk.Button(controls, text="Zoom -", command=self.on_zoom_out).grid(
+            row=0, column=7, sticky="e", padx=(4, 0)
+        )
+        ttk.Button(controls, text="Fit", command=self.on_zoom_fit).grid(
+            row=0, column=8, sticky="e", padx=(4, 0)
         )
 
         log_frame = ttk.Frame(self)
@@ -658,6 +670,7 @@ class App(tk.Tk):
         bitmap = page.render(scale=scale)
         self.page_image = bitmap.to_pil()
         self.crop_box = self._auto_crop(self.page_image)
+        self.zoom = 1.0
         self._draw_image()
         self._reset_clicks()
     def _auto_crop(self, image: Image.Image) -> Tuple[int, int, int, int]:
@@ -690,9 +703,12 @@ class App(tk.Tk):
         canvas_w = self.canvas.winfo_width() or 800
         canvas_h = self.canvas.winfo_height() or 600
         scale = min(canvas_w / self.page_image.width, canvas_h / self.page_image.height, 1.0)
-        self.display_scale = scale
+        self.display_scale = max(0.1, min(scale * self.zoom, 6.0))
         display = self.page_image.resize(
-            (int(self.page_image.width * scale), int(self.page_image.height * scale))
+            (
+                int(self.page_image.width * self.display_scale),
+                int(self.page_image.height * self.display_scale),
+            )
         )
         self.tk_image = ImageTk.PhotoImage(display)
         self.canvas.delete("all")
@@ -754,6 +770,24 @@ class App(tk.Tk):
         x1, y1 = event.x / self.display_scale, event.y / self.display_scale
         if abs(x1 - x0) < 3 and abs(y1 - y0) < 3:
             self._add_control_point((x1, y1))
+
+    def on_zoom_in(self) -> None:
+        self.zoom = min(self.zoom * 1.25, 6.0)
+        self._draw_image()
+
+    def on_zoom_out(self) -> None:
+        self.zoom = max(self.zoom / 1.25, 0.2)
+        self._draw_image()
+
+    def on_zoom_fit(self) -> None:
+        self.zoom = 1.0
+        self._draw_image()
+
+    def on_mouse_wheel(self, event: tk.Event) -> None:
+        if event.delta > 0:
+            self.on_zoom_in()
+        else:
+            self.on_zoom_out()
 
     def _add_control_point(self, pt: Tuple[float, float]) -> None:
         if len(self.click_points) < 2:

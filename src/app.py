@@ -849,14 +849,35 @@ class App(tk.Tk):
             messagebox.showerror("TPP Fetch Failed", str(exc))
 
     def _fetch_tpp_charts(self, apt: Airport) -> List[TppChart]:
-        state_name = STATE_NAME_BY_CODE.get(apt.state.upper(), "US")
-        resp = self._apra_get(
-            "/dtpp/chart",
-            params={"edition": "current", "geoname": state_name},
-        )
-        if resp is None:
+        if self._apra_headers() is None:
             raise RuntimeError("APRA credentials not configured.")
-        charts = self._parse_tpp_response(resp.text)
+
+        state_name = STATE_NAME_BY_CODE.get(apt.state.upper(), "")
+        params_list = [
+            {"edition": "current", "geoname": state_name} if state_name else {"edition": "current"},
+            {"edition": "current", "geoname": "US"},
+            {"edition": "current"},
+        ]
+
+        charts: List[TppChart] = []
+        last_error: Optional[Exception] = None
+        for params in params_list:
+            try:
+                resp = self._apra_get("/dtpp/chart", params=params)
+                if resp is None:
+                    continue
+                charts = self._parse_tpp_response(resp.text)
+                if charts:
+                    break
+            except requests.HTTPError as exc:
+                last_error = exc
+                if exc.response is not None and exc.response.status_code == 404:
+                    continue
+                raise
+
+        if not charts and last_error:
+            raise last_error
+
         # Filter by airport ident if present
         filtered = [c for c in charts if c.airport_id.upper() == apt.ident.upper()]
         return filtered or charts

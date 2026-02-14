@@ -231,8 +231,39 @@ class App(tk.Tk):
             self._log(f"Loaded {len(self.airports)} airports, {len(self.fixes)} fixes/navs.")
             self.on_search()
         except Exception as exc:
+            if "not a zip" in str(exc).lower():
+                zip_path = self._prompt_for_nasr_zip()
+                if zip_path:
+                    try:
+                        self._log("Parsing NASR CSVs...")
+                        self.airports, self.fixes = self._parse_nasr(zip_path)
+                        self._log(
+                            f"Loaded {len(self.airports)} airports, {len(self.fixes)} fixes/navs."
+                        )
+                        self.on_search()
+                        return
+                    except Exception as exc2:
+                        self._log(f"Error: {exc2}")
+                        messagebox.showerror("NASR Update Failed", str(exc2))
+                        return
             self._log(f"Error: {exc}")
             messagebox.showerror("NASR Update Failed", str(exc))
+
+    def _prompt_for_nasr_zip(self) -> Optional[Path]:
+        answer = messagebox.askyesno(
+            "NASR Download Failed",
+            "Download failed. Do you want to select a NASR ZIP file manually?",
+        )
+        if not answer:
+            return None
+        path = filedialog.askopenfilename(filetypes=[("NASR ZIP", "*.zip")])
+        if not path:
+            return None
+        zip_path = Path(path)
+        if not self._is_zip_file(zip_path):
+            messagebox.showwarning("Invalid File", "Selected file is not a ZIP.")
+            return None
+        return zip_path
 
     def _fetch_current_nasr_date(self) -> str:
         resp = requests.get(NASR_INDEX_URL, timeout=30)
@@ -247,32 +278,59 @@ class App(tk.Tk):
 
     def _download_nasr_zip(self, date: str) -> Path:
         NASR_DIR.mkdir(parents=True, exist_ok=True)
-        url = self._resolve_nasr_zip_url(date)
         dest = NASR_DIR / f"NASR_{date}.zip"
         if dest.exists():
             return dest
-        self._http_download(url, dest)
-        if not self._is_zip_file(dest):
-            dest.unlink(missing_ok=True)
-            raise RuntimeError("Downloaded NASR file is not a ZIP. Try Update NASR again.")
-        return dest
+        urls = self._resolve_nasr_zip_urls(date)
+        last_error: Optional[Exception] = None
+        for url in urls:
+            try:
+                self._http_download(url, dest, referer=f"{NASR_INDEX_URL}{date}/")
+                if self._is_zip_file(dest):
+                    return dest
+                dest.unlink(missing_ok=True)
+            except requests.RequestException as exc:
+                last_error = exc
+                if dest.exists():
+                    dest.unlink(missing_ok=True)
+                continue
 
-    def _resolve_nasr_zip_url(self, date: str) -> str:
-        # Prefer the cycle-specific page link; it changes more reliably than the legacy template.
-        page_url = f"{NASR_INDEX_URL}{date}"
-        try:
-            resp = requests.get(page_url, timeout=30)
-            resp.raise_for_status()
-            links = re.findall(r'href="([^"]+)"', resp.text)
-            for link in links:
-                if "Subscription" in link and link.lower().endswith(".zip"):
-                    return self._abs_url(page_url, link)
-                if link.lower().endswith(".zip") and "28day" in link.lower():
-                    return self._abs_url(page_url, link)
-        except requests.RequestException:
-            pass
+        raise RuntimeError("Downloaded NASR file is not a ZIP.") from last_error
 
-        return NASR_ZIP_TEMPLATE.format(date=date)
+    def _resolve_nasr_zip_urls(self, date: str) -> List[str]:
+        # Prefer links from the cycle page, then fallback to legacy template.
+        page_urls = [
+            f"{NASR_INDEX_URL}{date}/",
+            f"https://www.faa.gov/air_traffic/flight_info/aeronav/Aero_Data/NASR_Subscription/{date}/",
+        ]
+        urls: List[str] = []
+        for page_url in page_urls:
+            try:
+                resp = requests.get(page_url, timeout=30)
+                resp.raise_for_status()
+                links = re.findall(r'href="([^"]+)"', resp.text)
+                for link in links:
+                    if not link.lower().endswith(".zip"):
+                        continue
+                    urls.append(self._abs_url(page_url, link))
+            except requests.RequestException:
+                continue
+
+        def rank(u: str) -> int:
+            lu = u.lower()
+            if "csv.zip" in lu or "_csv.zip" in lu:
+                return 0
+            if "subscription_effective" in lu:
+                return 1
+            if "nfdc.faa.gov" in lu:
+                return 2
+            return 3
+
+        urls = sorted(dict.fromkeys(urls), key=rank)
+        urls.append(NASR_ZIP_TEMPLATE.format(date=date))
+        urls.append(f"https://nfdc.faa.gov/webContent/28DaySub/28DaySubscription_Effective_{date}_CSV.zip")
+        urls.append(f"https://nfdc.faa.gov/webContent/28DaySub/28DaySubscription_Effective_{date}.zip")
+        return urls
 
     def _abs_url(self, base: str, href: str) -> str:
         if href.startswith("http"):
@@ -290,6 +348,7 @@ class App(tk.Tk):
             return sig == b"PK\x03\x04"
         except OSError:
             return False
+
     def _parse_nasr(self, zip_path: Path) -> Tuple[Dict[str, Airport], List[FixPoint]]:
         airports: Dict[str, Airport] = {}
         runway_ends: Dict[Tuple[str, str], List[RunwayEnd]] = {}
@@ -780,8 +839,11 @@ class App(tk.Tk):
         c = 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a))
         return (r * c) / 1852.0
 
-    def _http_download(self, url: str, dest: Path) -> None:
-        resp = requests.get(url, stream=True, timeout=120)
+    def _http_download(self, url: str, dest: Path, referer: Optional[str] = None) -> None:
+        headers = {"User-Agent": "Mozilla/5.0", "Accept": "*/*"}
+        if referer:
+            headers["Referer"] = referer
+        resp = requests.get(url, stream=True, timeout=120, headers=headers)
         resp.raise_for_status()
         with open(dest, "wb") as f:
             for chunk in resp.iter_content(chunk_size=1024 * 1024):

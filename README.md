@@ -1,6 +1,6 @@
-﻿# FAA Plate KMZ Builder
+﻿# FAA Plate Georef (Runway-Click)
 
-This GUI helps non-technical users download FAA d-TPP GeoPDF approach plates and drop them straight into Google Earth.
+This app georeferences approach plates and airport diagrams with a simple two-click workflow using runway endpoints from FAA NASR data.
 
 ## Installer steps (baby steps)
 
@@ -9,21 +9,25 @@ This GUI helps non-technical users download FAA d-TPP GeoPDF approach plates and
    - Activate it with `.\.venv\Scripts\Activate.ps1`
 2. **Install the Python pieces**
    - Inside the activated shell, run `pip install -r requirements.txt`
-3. **Install GDAL tools**
-   - Install GDAL and make sure `gdal_translate` and `gdalinfo` are on PATH.
-4. **Launch the helper**
-   - Run `python src\app.py` from the same activated shell
+3. **Launch the app**
+   - Run `python src\app.py`
 
-## Using the app (step-by-step)
+## Workflow (two-click georef)
 
-1. Click **Update Data** to download the latest FAA `d-TPP_Metafile.xml` (stored under `data/cycles/`).
-2. Type an airport name, FAA ident, or ICAO ident into “Search Airport.” Matching airports appear in the list.
-3. Select an airport, then use the **Chart type** and **Approach** filters if you want to narrow the plate list.
-4. Leave **All plates** checked to export everything, or uncheck it and select the plates you need from the list.
-5. If you want non-georeferenced plates saved as PDF, turn on **Allow non-georeferenced (download PDF only)**.
-6. Set the output folder (click **Browse** if needed) and press **Generate** to create the KMZ/PDF files.
+1. Click **Update NASR** (downloads runway endpoints + fixes).
+2. Click **Load PDF** and select your chart.
+3. Search for the airport and select the runway.
+4. Click **Runway end A** and **Runway end B** on the chart.
+5. (Optional) Pick a nearby fix/VOR and click **Refine** for a 3-point fit.
+6. Click **Generate KMZ** and open it in Google Earth.
+
+## Notes
+
+- Default rendering is **400 DPI** for stable geometry.
+- If runway length error > 5%, the app asks you to re-click.
+- Output is a KMZ GroundOverlay using `gx:LatLonQuad` for rotation support.
 
 ## Output and cache
 
-- KMZ overlays and optional PDFs go to the folder you chose in the UI.
-- Downloaded PDFs and cycle XML stay under `data/cache/` and `data/cycles/` for reuse.
+- KMZ files go to the folder you select in the UI.
+- NASR downloads are cached under `data/nasr/`.

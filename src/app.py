@@ -247,12 +247,49 @@ class App(tk.Tk):
 
     def _download_nasr_zip(self, date: str) -> Path:
         NASR_DIR.mkdir(parents=True, exist_ok=True)
-        url = NASR_ZIP_TEMPLATE.format(date=date)
+        url = self._resolve_nasr_zip_url(date)
         dest = NASR_DIR / f"NASR_{date}.zip"
         if dest.exists():
             return dest
         self._http_download(url, dest)
+        if not self._is_zip_file(dest):
+            dest.unlink(missing_ok=True)
+            raise RuntimeError("Downloaded NASR file is not a ZIP. Try Update NASR again.")
         return dest
+
+    def _resolve_nasr_zip_url(self, date: str) -> str:
+        # Prefer the cycle-specific page link; it changes more reliably than the legacy template.
+        page_url = f"{NASR_INDEX_URL}{date}"
+        try:
+            resp = requests.get(page_url, timeout=30)
+            resp.raise_for_status()
+            links = re.findall(r'href="([^"]+)"', resp.text)
+            for link in links:
+                if "Subscription" in link and link.lower().endswith(".zip"):
+                    return self._abs_url(page_url, link)
+                if link.lower().endswith(".zip") and "28day" in link.lower():
+                    return self._abs_url(page_url, link)
+        except requests.RequestException:
+            pass
+
+        return NASR_ZIP_TEMPLATE.format(date=date)
+
+    def _abs_url(self, base: str, href: str) -> str:
+        if href.startswith("http"):
+            return href
+        if href.startswith("/"):
+            return "https://www.faa.gov" + href
+        if base.endswith("/"):
+            return base + href
+        return base + "/" + href
+
+    def _is_zip_file(self, path: Path) -> bool:
+        try:
+            with open(path, "rb") as f:
+                sig = f.read(4)
+            return sig == b"PK\x03\x04"
+        except OSError:
+            return False
     def _parse_nasr(self, zip_path: Path) -> Tuple[Dict[str, Airport], List[FixPoint]]:
         airports: Dict[str, Airport] = {}
         runway_ends: Dict[Tuple[str, str], List[RunwayEnd]] = {}

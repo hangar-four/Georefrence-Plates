@@ -7,6 +7,7 @@ import os
 import re
 import shutil
 import tempfile
+import time
 import threading
 import zipfile
 from dataclasses import dataclass
@@ -25,6 +26,7 @@ import numpy as np
 
 NASR_INDEX_URL = "https://www.faa.gov/air_traffic/flight_info/aeronav/aero_data/NASR_Subscription/"
 NASR_ZIP_TEMPLATE = "https://nfdc.faa.gov/webContent/28DaySub/28DaySubscription_Effective_{date}.zip"
+APRA_BASE = os.environ.get("APRA_BASE_URL", "https://external-api.faa.gov/apra")
 DATA_DIR = Path("data")
 NASR_DIR = DATA_DIR / "nasr"
 CACHE_DIR = DATA_DIR / "cache"
@@ -87,6 +89,8 @@ class App(tk.Tk):
 
         self.click_points: List[Tuple[float, float]] = []
         self.refine_point: Optional[Tuple[float, float]] = None
+        self._apra_token: Optional[str] = None
+        self._apra_token_expiry: float = 0.0
 
         self._build_ui()
         self._load_last_nasr_date()
@@ -281,6 +285,18 @@ class App(tk.Tk):
         dest = NASR_DIR / f"NASR_{date}.zip"
         if dest.exists():
             return dest
+        try:
+            resp = self._apra_get("/nfdc/nasr/chart", params={"edition": "current"})
+            if resp is not None:
+                url = self._extract_first_url(resp.text)
+                if url:
+                    self._http_download(url, dest)
+                    if self._is_zip_file(dest):
+                        return dest
+                    dest.unlink(missing_ok=True)
+        except Exception:
+            if dest.exists():
+                dest.unlink(missing_ok=True)
         urls = self._resolve_nasr_zip_urls(date)
         last_error: Optional[Exception] = None
         for url in urls:
@@ -348,6 +364,76 @@ class App(tk.Tk):
             return sig == b"PK\x03\x04"
         except OSError:
             return False
+
+    def _apra_get(self, path: str, params: Optional[Dict[str, str]] = None) -> Optional[requests.Response]:
+        headers = self._apra_headers()
+        if headers is None:
+            return None
+        url = f"{APRA_BASE}{path}"
+        resp = requests.get(url, params=params, headers=headers, timeout=30)
+        resp.raise_for_status()
+        return resp
+
+    def _apra_headers(self) -> Optional[Dict[str, str]]:
+        api_key = os.environ.get("APRA_API_KEY")
+        api_key_header = os.environ.get("APRA_API_KEY_HEADER", "x-api-key")
+        bearer = os.environ.get("APRA_BEARER_TOKEN")
+        token_url = os.environ.get("APRA_TOKEN_URL")
+        client_id = os.environ.get("APRA_CLIENT_ID")
+        client_secret = os.environ.get("APRA_CLIENT_SECRET")
+        scope = os.environ.get("APRA_SCOPE")
+
+        if api_key:
+            return {api_key_header: api_key}
+        if bearer:
+            return {"Authorization": f"Bearer {bearer}"}
+        if token_url and client_id and client_secret:
+            token = self._get_apra_token(token_url, client_id, client_secret, scope)
+            return {"Authorization": f"Bearer {token}"}
+        return None
+
+    def _get_apra_token(self, token_url: str, client_id: str, client_secret: str, scope: Optional[str]) -> str:
+        now = time.time()
+        if self._apra_token and now < self._apra_token_expiry:
+            return self._apra_token
+
+        data = {"grant_type": "client_credentials"}
+        if scope:
+            data["scope"] = scope
+        resp = requests.post(
+            token_url,
+            data=data,
+            auth=(client_id, client_secret),
+            headers={"Accept": "application/json"},
+            timeout=30,
+        )
+        resp.raise_for_status()
+        payload = resp.json()
+        token = payload.get("access_token")
+        expires_in = int(payload.get("expires_in", 3600))
+        if not token:
+            raise RuntimeError("APRA token response missing access_token.")
+        self._apra_token = token
+        self._apra_token_expiry = now + max(60, expires_in - 60)
+        return token
+
+    def _extract_first_url(self, text: str) -> Optional[str]:
+        # JSON first
+        try:
+            data = json.loads(text)
+            if isinstance(data, dict):
+                for k, v in data.items():
+                    if k.lower() == "url" and isinstance(v, str):
+                        return v
+            if isinstance(data, list):
+                for item in data:
+                    if isinstance(item, dict) and "url" in item:
+                        return item["url"]
+        except Exception:
+            pass
+        # Fallback: any URL ending in .zip
+        match = re.search(r"(https?://[^\\s\"']+\\.zip)", text, re.IGNORECASE)
+        return match.group(1) if match else None
 
     def _parse_nasr(self, zip_path: Path) -> Tuple[Dict[str, Airport], List[FixPoint]]:
         airports: Dict[str, Airport] = {}

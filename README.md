@@ -27,6 +27,17 @@ This app georeferences approach plates and airport diagrams with a simple two-cl
 - If runway length error > 5%, the app asks you to re-click.
 - Output is a KMZ GroundOverlay using `gx:LatLonQuad` for rotation support.
 
+## APRA API (optional)
+
+If you have FAA APRA access, set these environment variables to let the app
+pull NASR data through the API instead of the public download page:
+
+- `APRA_BASE_URL` (default `https://external-api.faa.gov/apra`)
+- `APRA_API_KEY` and `APRA_API_KEY_HEADER` (if API key auth)
+- or `APRA_TOKEN_URL`, `APRA_CLIENT_ID`, `APRA_CLIENT_SECRET`, `APRA_SCOPE`
+
+If none are set, the app falls back to the public NASR download.
+
 ## Output and cache
 
 - KMZ files go to the folder you select in the UI.

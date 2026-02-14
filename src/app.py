@@ -1,4 +1,5 @@
 ﻿import json
+import os
 import re
 import shutil
 import subprocess
@@ -20,6 +21,7 @@ DATA_DIR = Path("data")
 CACHE_DIR = DATA_DIR / "cache"
 CYCLES_DIR = DATA_DIR / "cycles"
 LAST_CYCLE_FILE = DATA_DIR / "last_cycle.txt"
+GDAL_PATH_FILE = DATA_DIR / "gdal_path.txt"
 
 APPROACH_TYPES = [
     "Any",
@@ -72,6 +74,7 @@ class App(tk.Tk):
 
         self._build_ui()
         self._load_last_cycle()
+        self._load_gdal_path()
 
     def _build_ui(self) -> None:
         self.columnconfigure(0, weight=1)
@@ -175,6 +178,16 @@ class App(tk.Tk):
     def _load_last_cycle(self) -> None:
         if LAST_CYCLE_FILE.exists():
             self.cycle_var.set(LAST_CYCLE_FILE.read_text(encoding="utf-8").strip())
+
+    def _load_gdal_path(self) -> None:
+        if GDAL_PATH_FILE.exists():
+            gdal_dir = GDAL_PATH_FILE.read_text(encoding="utf-8").strip()
+            if gdal_dir:
+                os.environ["PATH"] = f"{gdal_dir}{os.pathsep}{os.environ.get('PATH','')}"
+
+    def _save_gdal_path(self, gdal_dir: Path) -> None:
+        DATA_DIR.mkdir(parents=True, exist_ok=True)
+        GDAL_PATH_FILE.write_text(str(gdal_dir), encoding="utf-8")
 
     def on_browse(self) -> None:
         folder = filedialog.askdirectory(initialdir=self.output_var.get())
@@ -323,9 +336,10 @@ class App(tk.Tk):
     def _generate_worker(self, plates: List[PlateRecord], output_dir: Path) -> None:
         try:
             if not self._gdal_available():
-                raise RuntimeError(
-                    "GDAL tools not found in PATH (gdal_translate, gdalinfo)."
-                )
+                if not self._prompt_for_gdal_path():
+                    raise RuntimeError(
+                        "GDAL tools not found in PATH (gdal_translate, gdalinfo)."
+                    )
 
             cycle = self.cycle_var.get().strip()
             if not cycle:
@@ -384,6 +398,24 @@ class App(tk.Tk):
 
     def _gdal_available(self) -> bool:
         return bool(shutil.which("gdal_translate") and shutil.which("gdalinfo"))
+
+    def _prompt_for_gdal_path(self) -> bool:
+        answer = messagebox.askyesno(
+            "GDAL Not Found",
+            "GDAL tools were not found in PATH. Do you want to locate gdal_translate.exe?",
+        )
+        if not answer:
+            return False
+        exe_path = filedialog.askopenfilename(
+            title="Select gdal_translate.exe",
+            filetypes=[("gdal_translate.exe", "gdal_translate.exe"), ("Executable", "*.exe")],
+        )
+        if not exe_path:
+            return False
+        gdal_dir = Path(exe_path).parent
+        os.environ["PATH"] = f"{gdal_dir}{os.pathsep}{os.environ.get('PATH','')}"
+        self._save_gdal_path(gdal_dir)
+        return self._gdal_available()
 
     def _fetch_latest_cycle(self) -> str:
         resp = requests.get(f"{FAA_BASE}/", timeout=30)
@@ -564,3 +596,6 @@ if __name__ == "__main__":
     CACHE_DIR.mkdir(parents=True, exist_ok=True)
     CYCLES_DIR.mkdir(parents=True, exist_ok=True)
     App().mainloop()
+
+
+

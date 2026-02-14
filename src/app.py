@@ -852,11 +852,16 @@ class App(tk.Tk):
         if self._apra_headers() is None:
             raise RuntimeError("APRA credentials not configured.")
 
-        state_name = STATE_NAME_BY_CODE.get(apt.state.upper(), "")
+        state_code = apt.state.upper() if apt.state else ""
+        state_name = STATE_NAME_BY_CODE.get(state_code, "")
         params_list = [
             {"edition": "current", "geoname": state_name} if state_name else {"edition": "current"},
+            {"edition": "current", "geoname": state_name.upper()} if state_name else {"edition": "current"},
+            {"edition": "current", "geoname": state_code} if state_code else {"edition": "current"},
             {"edition": "current", "geoname": "US"},
             {"edition": "current"},
+            {"edition": "CURRENT", "geoname": "US"},
+            {"edition": "CURRENT"},
         ]
 
         charts: List[TppChart] = []
@@ -869,9 +874,11 @@ class App(tk.Tk):
                 charts = self._parse_tpp_response(resp.text)
                 if charts:
                     break
-            except requests.HTTPError as exc:
+            except requests.RequestException as exc:
                 last_error = exc
-                if exc.response is not None and exc.response.status_code == 404:
+                status = getattr(exc, "response", None).status_code if getattr(exc, "response", None) else None
+                if status == 404:
+                    self._log(f"TPP 404 for params: {params}")
                     continue
                 raise
 

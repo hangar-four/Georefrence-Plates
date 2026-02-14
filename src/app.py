@@ -35,6 +35,60 @@ LAST_NASR_DATE_FILE = DATA_DIR / "last_nasr_date.txt"
 DPI = 400
 DEFAULT_OUTPUT_DIR = Path("output")
 
+STATE_NAME_BY_CODE = {
+    "AL": "Alabama",
+    "AK": "Alaska",
+    "AZ": "Arizona",
+    "AR": "Arkansas",
+    "CA": "California",
+    "CO": "Colorado",
+    "CT": "Connecticut",
+    "DE": "Delaware",
+    "FL": "Florida",
+    "GA": "Georgia",
+    "HI": "Hawaii",
+    "ID": "Idaho",
+    "IL": "Illinois",
+    "IN": "Indiana",
+    "IA": "Iowa",
+    "KS": "Kansas",
+    "KY": "Kentucky",
+    "LA": "Louisiana",
+    "ME": "Maine",
+    "MD": "Maryland",
+    "MA": "Massachusetts",
+    "MI": "Michigan",
+    "MN": "Minnesota",
+    "MS": "Mississippi",
+    "MO": "Missouri",
+    "MT": "Montana",
+    "NE": "Nebraska",
+    "NV": "Nevada",
+    "NH": "New Hampshire",
+    "NJ": "New Jersey",
+    "NM": "New Mexico",
+    "NY": "New York",
+    "NC": "North Carolina",
+    "ND": "North Dakota",
+    "OH": "Ohio",
+    "OK": "Oklahoma",
+    "OR": "Oregon",
+    "PA": "Pennsylvania",
+    "RI": "Rhode Island",
+    "SC": "South Carolina",
+    "SD": "South Dakota",
+    "TN": "Tennessee",
+    "TX": "Texas",
+    "UT": "Utah",
+    "VT": "Vermont",
+    "VA": "Virginia",
+    "WA": "Washington",
+    "WV": "West Virginia",
+    "WI": "Wisconsin",
+    "WY": "Wyoming",
+    "DC": "District of Columbia",
+}
+
 
 @dataclass
 class RunwayEnd:
@@ -57,6 +111,7 @@ class Airport:
     name: str
     lat: float
     lon: float
+    state: str
     runways: List[Runway]
 
 
@@ -66,6 +121,13 @@ class FixPoint:
     lat: float
     lon: float
     kind: str
+
+
+@dataclass
+class TppChart:
+    airport_id: str
+    chart_name: str
+    url: str
 
 
 class App(tk.Tk):
@@ -80,6 +142,7 @@ class App(tk.Tk):
         self.selected_runway: Optional[Runway] = None
         self.fixes: List[FixPoint] = []
         self.nearby_fixes: List[FixPoint] = []
+        self.tpp_charts: List[TppChart] = []
 
         self.pdf_path: Optional[Path] = None
         self.page_image: Optional[Image.Image] = None
@@ -142,9 +205,19 @@ class App(tk.Tk):
         mid.add(left, weight=1)
 
         ttk.Label(left, text="Airports").grid(row=0, column=0, sticky="w")
-        self.airport_list = tk.Listbox(left, height=18)
+        self.airport_list = tk.Listbox(left, height=14)
         self.airport_list.grid(row=1, column=0, sticky="nsew")
         self.airport_list.bind("<<ListboxSelect>>", lambda _e: self.on_airport_select())
+
+        ttk.Label(left, text="Approaches").grid(row=2, column=0, sticky="w", pady=(6, 0))
+        self.tpp_list = tk.Listbox(left, height=10)
+        self.tpp_list.grid(row=3, column=0, sticky="nsew")
+        ttk.Button(left, text="Fetch Approaches", command=self.on_fetch_tpp).grid(
+            row=4, column=0, sticky="ew", pady=(6, 0)
+        )
+        ttk.Button(left, text="Load Selected PDF", command=self.on_load_selected_tpp).grid(
+            row=5, column=0, sticky="ew", pady=(4, 0)
+        )
 
         right = ttk.Frame(mid)
         right.columnconfigure(0, weight=1)
@@ -161,6 +234,9 @@ class App(tk.Tk):
         self.canvas.bind("<Button-3>", self.on_pan_start)
         self.canvas.bind("<B3-Motion>", self.on_pan_drag)
         self.canvas.bind("<ButtonRelease-3>", self.on_pan_release)
+        self.canvas.bind("<Button-2>", self.on_pan_start)
+        self.canvas.bind("<B2-Motion>", self.on_pan_drag)
+        self.canvas.bind("<ButtonRelease-2>", self.on_pan_release)
         self.canvas.bind("<MouseWheel>", self.on_mouse_wheel)
         self.canvas.bind("<Configure>", lambda _e: self._draw_image())
 
@@ -396,13 +472,17 @@ class App(tk.Tk):
         api_key = os.environ.get("APRA_API_KEY")
         api_key_header = os.environ.get("APRA_API_KEY_HEADER", "x-api-key")
         bearer = os.environ.get("APRA_BEARER_TOKEN")
-        token_url = os.environ.get("APRA_TOKEN_URL")
+        client_id_header = os.environ.get("APRA_CLIENT_ID_HEADER", "client_id")
+        client_secret_header = os.environ.get("APRA_CLIENT_SECRET_HEADER", "client_secret")
         client_id = os.environ.get("APRA_CLIENT_ID")
         client_secret = os.environ.get("APRA_CLIENT_SECRET")
+        token_url = os.environ.get("APRA_TOKEN_URL")
         scope = os.environ.get("APRA_SCOPE")
 
         if api_key:
             return {api_key_header: api_key}
+        if client_id and client_secret:
+            return {client_id_header: client_id, client_secret_header: client_secret}
         if bearer:
             return {"Authorization": f"Bearer {bearer}"}
         if token_url and client_id and client_secret:
@@ -512,7 +592,15 @@ class App(tk.Tk):
             lon = self._parse_latlon(self._get_any(row, ["ARPT_LON_DECIMAL", "LONG_DECIMAL", "LONGITUDE"]))
             if lat is None or lon is None:
                 continue
-            airports[apt_id] = Airport(ident=apt_id, name=name_val, lat=lat, lon=lon, runways=[])
+            state = (self._get_any(row, ["STATE_CODE", "STATE", "ARPT_STATE"]) or "").strip()
+            airports[apt_id] = Airport(
+                ident=apt_id,
+                name=name_val,
+                lat=lat,
+                lon=lon,
+                state=state,
+                runways=[],
+            )
         return airports
 
     def _load_apt_rwy(self, zf: zipfile.ZipFile, name: str) -> Dict[Tuple[str, str], float]:
@@ -650,6 +738,98 @@ class App(tk.Tk):
         self.fix_combo["values"] = labels
         self.fix_var.set("None")
         self.nearby_fixes = nearby
+
+    def on_fetch_tpp(self) -> None:
+        if not self.selected_airport:
+            messagebox.showwarning("Missing airport", "Select an airport first.")
+            return
+        threading.Thread(target=self._fetch_tpp_worker, daemon=True).start()
+
+    def _fetch_tpp_worker(self) -> None:
+        try:
+            apt = self.selected_airport
+            self._log("Fetching TPP charts from APRA...")
+            charts = self._fetch_tpp_charts(apt)
+            self.tpp_charts = charts
+            self.tpp_list.delete(0, "end")
+            for c in charts:
+                self.tpp_list.insert("end", c.chart_name)
+            self._log(f"Loaded {len(charts)} approach charts.")
+        except Exception as exc:
+            self._log(f"Error: {exc}")
+            messagebox.showerror("TPP Fetch Failed", str(exc))
+
+    def _fetch_tpp_charts(self, apt: Airport) -> List[TppChart]:
+        state_name = STATE_NAME_BY_CODE.get(apt.state.upper(), "US")
+        resp = self._apra_get(
+            "/dtpp/chart",
+            params={"edition": "current", "geoname": state_name},
+        )
+        if resp is None:
+            raise RuntimeError("APRA credentials not configured.")
+        charts = self._parse_tpp_response(resp.text)
+        # Filter by airport ident if present
+        filtered = [c for c in charts if c.airport_id.upper() == apt.ident.upper()]
+        return filtered or charts
+
+    def _parse_tpp_response(self, text: str) -> List[TppChart]:
+        charts: List[TppChart] = []
+        try:
+            data = json.loads(text)
+            items = []
+            if isinstance(data, dict):
+                for k in ("product", "products", "edition", "data"):
+                    if k in data:
+                        items = data[k]
+                        break
+            elif isinstance(data, list):
+                items = data
+            if isinstance(items, dict):
+                items = [items]
+            for item in items:
+                if not isinstance(item, dict):
+                    continue
+                airport_id = str(item.get("airportId") or item.get("airport_id") or "")
+                chart_name = str(item.get("chartName") or item.get("chart_name") or "")
+                url = str(item.get("url") or "")
+                if url and chart_name:
+                    charts.append(TppChart(airport_id=airport_id, chart_name=chart_name, url=url))
+        except Exception:
+            pass
+
+        if charts:
+            return charts
+
+        # XML fallback
+        urls = re.findall(r"<url>([^<]+)</url>", text)
+        names = re.findall(r"<chartName>([^<]+)</chartName>", text)
+        airports = re.findall(r"<airportId>([^<]+)</airportId>", text)
+        for i, url in enumerate(urls):
+            chart_name = names[i] if i < len(names) else url.split("/")[-1]
+            airport_id = airports[i] if i < len(airports) else ""
+            charts.append(TppChart(airport_id=airport_id, chart_name=chart_name, url=url))
+        return charts
+
+    def on_load_selected_tpp(self) -> None:
+        if not self.tpp_list.curselection():
+            messagebox.showwarning("Missing selection", "Select an approach first.")
+            return
+        idx = self.tpp_list.curselection()[0]
+        chart = self.tpp_charts[idx]
+        threading.Thread(target=self._download_and_load_tpp, args=(chart,), daemon=True).start()
+
+    def _download_and_load_tpp(self, chart: TppChart) -> None:
+        try:
+            CACHE_DIR.mkdir(parents=True, exist_ok=True)
+            dest = CACHE_DIR / Path(chart.url).name
+            if not dest.exists():
+                self._log(f"Downloading {chart.chart_name}...")
+                self._http_download(chart.url, dest)
+            self.pdf_path = dest
+            self._render_pdf()
+        except Exception as exc:
+            self._log(f"Error: {exc}")
+            messagebox.showerror("Download Failed", str(exc))
 
     def _find_nearby_fixes(self, lat: float, lon: float, radius_nm: float) -> List[FixPoint]:
         out: List[FixPoint] = []

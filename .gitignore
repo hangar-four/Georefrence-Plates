@@ -3,3 +3,7 @@
 output/
 data/cache/
 data/cycles/
+dist/
+build/
+*.spec
+

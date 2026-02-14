@@ -494,10 +494,24 @@ class App(tk.Tk):
         if dest.exists():
             return dest
 
-        url = f"{FAA_BASE}/{cycle}/{rec.volume}/{rec.pdf_name}"
+        urls = []
+        if rec.volume:
+            urls.append(f"{FAA_BASE}/{cycle}/{rec.volume}/{rec.pdf_name}")
+        urls.append(f"{FAA_BASE}/{cycle}/{rec.pdf_name}")
+
         self._log(f"Downloading {rec.pdf_name}...")
-        self._http_download(url, dest)
-        return dest
+        last_error: Optional[Exception] = None
+        for url in urls:
+            try:
+                self._http_download(url, dest)
+                return dest
+            except requests.HTTPError as exc:
+                last_error = exc
+                if exc.response is not None and exc.response.status_code == 404:
+                    continue
+                raise
+
+        raise RuntimeError(f"PDF not found for {rec.pdf_name}") from last_error
 
     def _is_georeferenced(self, pdf_path: Path) -> bool:
         try:

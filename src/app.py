@@ -1,5 +1,4 @@
-import json
-import os
+﻿import json
 import re
 import shutil
 import subprocess
@@ -8,7 +7,7 @@ import tempfile
 import zipfile
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import List, Optional
 
 import requests
 import xml.etree.ElementTree as ET
@@ -17,15 +16,10 @@ from tkinter import ttk, filedialog, messagebox
 
 
 FAA_BASE = "https://aeronav.faa.gov/d-tpp"
-GISINTERNALS_RELEASE_URL = "https://www.gisinternals.com/release.php"
-GISINTERNALS_BASE = "https://download.gisinternals.com"
 DATA_DIR = Path("data")
 CACHE_DIR = DATA_DIR / "cache"
 CYCLES_DIR = DATA_DIR / "cycles"
 LAST_CYCLE_FILE = DATA_DIR / "last_cycle.txt"
-APP_NAME = "Georef-Plates"
-APP_DATA_DIR = Path(os.environ.get("LOCALAPPDATA", str(Path.home() / "AppData/Local"))) / APP_NAME
-GDAL_DIR = APP_DATA_DIR / "gdal"
 
 APPROACH_TYPES = [
     "Any",
@@ -328,7 +322,10 @@ class App(tk.Tk):
 
     def _generate_worker(self, plates: List[PlateRecord], output_dir: Path) -> None:
         try:
-            self._ensure_gdal()
+            if not self._gdal_available():
+                raise RuntimeError(
+                    "GDAL tools not found in PATH (gdal_translate, gdalinfo)."
+                )
 
             cycle = self.cycle_var.get().strip()
             if not cycle:
@@ -385,164 +382,8 @@ class App(tk.Tk):
             self._log(f"Error: {exc}")
             messagebox.showerror("Generate Failed", str(exc))
 
-    def _gdal_exec(self, name: str) -> Optional[Path]:
-        local_candidates = [
-            GDAL_DIR / "bin" / "gdal" / "apps" / f"{name}.exe",
-            GDAL_DIR / "bin" / f"{name}.exe",
-        ]
-        for candidate in local_candidates:
-            if candidate.exists():
-                return candidate
-        found = shutil.which(name)
-        return Path(found) if found else None
-
-    def _gdal_env(self) -> Dict[str, str]:
-        env = os.environ.copy()
-        bin_dir = GDAL_DIR / "bin"
-        apps_dir = GDAL_DIR / "bin" / "gdal" / "apps"
-        if bin_dir.exists() or apps_dir.exists():
-            parts = [str(apps_dir), str(bin_dir), env.get("PATH", "")]
-            env["PATH"] = os.pathsep.join([p for p in parts if p])
-            data_dir = GDAL_DIR / "bin" / "gdal"
-            if data_dir.exists():
-                env.setdefault("GDAL_DATA", str(data_dir))
-            plugins_dir = GDAL_DIR / "bin" / "gdal" / "plugins"
-            if plugins_dir.exists():
-                env.setdefault("GDAL_DRIVER_PATH", str(plugins_dir))
-        return env
-
-    def _run_gdal(self, args: List[str], capture_output: bool = False) -> subprocess.CompletedProcess:
-        exe = self._gdal_exec(args[0])
-        if exe:
-            args = [str(exe)] + args[1:]
-        return subprocess.run(
-            args,
-            capture_output=capture_output,
-            text=True,
-            check=True,
-            env=self._gdal_env(),
-        )
-
     def _gdal_available(self) -> bool:
-        return bool(self._gdal_exec("gdal_translate") and self._gdal_exec("gdalinfo"))
-
-    def _ensure_gdal(self) -> None:
-        if self._gdal_available():
-            return
-        answer = messagebox.askyesno(
-            "GDAL Required",
-            "GDAL tools were not found. Download and install now?",
-        )
-        if not answer:
-            raise RuntimeError("GDAL tools not available.")
-        self._download_and_install_gdal()
-        if not self._gdal_available():
-            raise RuntimeError("GDAL install failed or tools not found.")
-
-    def _get_latest_gdal_zip_url(self) -> str:
-        candidates = self._get_gdal_candidates()
-        if not candidates:
-            raise RuntimeError("Could not find GDAL download on GISInternals.")
-        for name in candidates:
-            url = self._resolve_gdal_url(name)
-            if url:
-                return url
-        raise RuntimeError("Could not resolve a working GDAL download URL.")
-
-    def _get_gdal_candidates(self) -> List[str]:
-        pages = [
-            GISINTERNALS_RELEASE_URL,
-            "https://download.gisinternals.com/release.php",
-            "https://download.gisinternals.com/stable.php",
-        ]
-        found = []
-        for page in pages:
-            try:
-                resp = requests.get(page, timeout=30)
-                resp.raise_for_status()
-                matches = re.findall(r"(release-(\d+)-x64-gdal-[^\"<>\s]+)", resp.text)
-                found.extend(matches)
-            except requests.RequestException:
-                continue
-        unique = {name: int(num) for name, num in found}
-        return [k for k, _ in sorted(unique.items(), key=lambda kv: kv[1], reverse=True)]
-
-    def _resolve_gdal_url(self, name: str) -> Optional[str]:
-        file_name = name if name.endswith(".zip") else name + ".zip"
-        query_urls = [
-            f"{GISINTERNALS_BASE}/query.html?content=filelist&file={file_name}",
-            f"https://www.gisinternals.com/query.html?content=filelist&file={file_name}",
-            f"http://www.gisinternals.com/query.html?content=filelist&file={file_name}",
-        ]
-        try:
-            for query_url in query_urls:
-                resp = requests.get(query_url, timeout=20)
-                if resp.status_code == 200:
-                    content_type = resp.headers.get("content-type", "").lower()
-                    if "zip" in content_type:
-                        return query_url
-                    # Look for direct download links in the file list page.
-                    links = re.findall(r'href="([^"]+)"', resp.text)
-                    links += re.findall(r"(https?://[^\\s\"']+)", resp.text)
-                    candidates = []
-                    for link in links:
-                        if file_name not in link:
-                            continue
-                        if link.startswith("http"):
-                            candidates.append(link)
-                        elif link.startswith("/"):
-                            candidates.append(f"{GISINTERNALS_BASE}{link}")
-                        else:
-                            candidates.append(f"{GISINTERNALS_BASE}/{link}")
-                    for url in candidates:
-                        if self._url_exists(url):
-                            return url
-        except requests.RequestException:
-            pass
-
-        base_names = [file_name]
-        bases = [
-            GISINTERNALS_BASE,
-            "https://download.gisinternals.com/release",
-            "https://download.gisinternals.com/stable",
-            "https://download.gisinternals.com/download",
-        ]
-        for base in bases:
-            for n in base_names:
-                url = f"{base}/{n}"
-                if self._url_exists(url):
-                    return url
-        return None
-
-    def _url_exists(self, url: str) -> bool:
-        try:
-            head = requests.head(url, timeout=15, allow_redirects=True)
-            if head.status_code == 200:
-                return True
-            if head.status_code in (403, 405):
-                get = requests.get(url, stream=True, timeout=15)
-                return get.status_code == 200
-        except requests.RequestException:
-            return False
-        return False
-
-    def _download_and_install_gdal(self) -> None:
-        APP_DATA_DIR.mkdir(parents=True, exist_ok=True)
-        if GDAL_DIR.exists():
-            shutil.rmtree(GDAL_DIR)
-        GDAL_DIR.mkdir(parents=True, exist_ok=True)
-        url = self._get_latest_gdal_zip_url()
-        zip_path = APP_DATA_DIR / "gdal.zip"
-        self._log(f"Downloading GDAL from {url}...")
-        self._http_download(url, zip_path)
-        self._log("Extracting GDAL...")
-        with zipfile.ZipFile(zip_path, "r") as zf:
-            zf.extractall(GDAL_DIR)
-        try:
-            zip_path.unlink()
-        except OSError:
-            pass
-        self._log(f"GDAL installed to {GDAL_DIR}")
+        return bool(shutil.which("gdal_translate") and shutil.which("gdalinfo"))
 
     def _fetch_latest_cycle(self) -> str:
         resp = requests.get(f"{FAA_BASE}/", timeout=30)
@@ -628,7 +469,12 @@ class App(tk.Tk):
 
     def _is_georeferenced(self, pdf_path: Path) -> bool:
         try:
-            result = self._run_gdal(["gdalinfo", "-json", str(pdf_path)], capture_output=True)
+            result = subprocess.run(
+                ["gdalinfo", "-json", str(pdf_path)],
+                capture_output=True,
+                text=True,
+                check=True,
+            )
             data = json.loads(result.stdout)
             if data.get("geoTransform"):
                 return True
@@ -638,7 +484,16 @@ class App(tk.Tk):
             return False
 
     def _gdal_kmz_single(self, pdf_path: Path, out_path: Path) -> None:
-        self._run_gdal(["gdal_translate", "-of", "KMLSUPEROVERLAY", str(pdf_path), str(out_path)])
+        subprocess.run(
+            [
+                "gdal_translate",
+                "-of",
+                "KMLSUPEROVERLAY",
+                str(pdf_path),
+                str(out_path),
+            ],
+            check=True,
+        )
 
     def _gdal_kmz_multi(self, cycle: str, plates: List[PlateRecord], out_path: Path) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -649,7 +504,16 @@ class App(tk.Tk):
                 slug = self._safe_name(f"{rec.chart_code}_{rec.chart_name}")
                 plate_dir = tmp_dir / slug
                 plate_dir.mkdir(parents=True, exist_ok=True)
-                self._run_gdal(["gdal_translate", "-of", "KMLSUPEROVERLAY", str(pdf_path), str(plate_dir)])
+                subprocess.run(
+                    [
+                        "gdal_translate",
+                        "-of",
+                        "KMLSUPEROVERLAY",
+                        str(pdf_path),
+                        str(plate_dir),
+                    ],
+                    check=True,
+                )
                 plate_dirs.append(plate_dir)
 
             master_kml = self._build_master_kml(plate_dirs)
@@ -700,4 +564,3 @@ if __name__ == "__main__":
     CACHE_DIR.mkdir(parents=True, exist_ok=True)
     CYCLES_DIR.mkdir(parents=True, exist_ok=True)
     App().mainloop()
-

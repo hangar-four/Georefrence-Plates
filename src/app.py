@@ -86,6 +86,8 @@ class App(tk.Tk):
         self.crop_box: Optional[Tuple[int, int, int, int]] = None
         self.display_scale: float = 1.0
         self.zoom: float = 1.0
+        self.pan_x: float = 0.0
+        self.pan_y: float = 0.0
         self.tk_image: Optional[ImageTk.PhotoImage] = None
 
         self.click_points: List[Tuple[float, float]] = []
@@ -156,6 +158,9 @@ class App(tk.Tk):
         self.canvas.bind("<Button-1>", self.on_canvas_click)
         self.canvas.bind("<B1-Motion>", self.on_canvas_drag)
         self.canvas.bind("<ButtonRelease-1>", self.on_canvas_release)
+        self.canvas.bind("<Button-3>", self.on_pan_start)
+        self.canvas.bind("<B3-Motion>", self.on_pan_drag)
+        self.canvas.bind("<ButtonRelease-3>", self.on_pan_release)
         self.canvas.bind("<MouseWheel>", self.on_mouse_wheel)
         self.canvas.bind("<Configure>", lambda _e: self._draw_image())
 
@@ -213,6 +218,7 @@ class App(tk.Tk):
         self._dragging = False
         self._drag_start = None
         self._crop_rect_id = None
+        self._pan_anchor = None
 
     def _log(self, msg: str) -> None:
         self.log_text.insert("end", msg + "\n")
@@ -671,6 +677,8 @@ class App(tk.Tk):
         self.page_image = bitmap.to_pil()
         self.crop_box = self._auto_crop(self.page_image)
         self.zoom = 1.0
+        self.pan_x = 0.0
+        self.pan_y = 0.0
         self._draw_image()
         self._reset_clicks()
     def _auto_crop(self, image: Image.Image) -> Tuple[int, int, int, int]:
@@ -702,8 +710,8 @@ class App(tk.Tk):
             return
         canvas_w = self.canvas.winfo_width() or 800
         canvas_h = self.canvas.winfo_height() or 600
-        scale = min(canvas_w / self.page_image.width, canvas_h / self.page_image.height, 1.0)
-        self.display_scale = max(0.1, min(scale * self.zoom, 6.0))
+        scale = min(canvas_w / self.page_image.width, canvas_h / self.page_image.height)
+        self.display_scale = max(0.1, min(scale * self.zoom, 8.0))
         display = self.page_image.resize(
             (
                 int(self.page_image.width * self.display_scale),
@@ -712,7 +720,7 @@ class App(tk.Tk):
         )
         self.tk_image = ImageTk.PhotoImage(display)
         self.canvas.delete("all")
-        self.canvas.create_image(0, 0, anchor="nw", image=self.tk_image)
+        self.canvas.create_image(self.pan_x, self.pan_y, anchor="nw", image=self.tk_image)
         self._draw_crop_box()
         self._draw_clicks()
 
@@ -720,10 +728,10 @@ class App(tk.Tk):
         if not self.crop_box:
             return
         x1, y1, x2, y2 = self.crop_box
-        x1 *= self.display_scale
-        y1 *= self.display_scale
-        x2 *= self.display_scale
-        y2 *= self.display_scale
+        x1 = x1 * self.display_scale + self.pan_x
+        y1 = y1 * self.display_scale + self.pan_y
+        x2 = x2 * self.display_scale + self.pan_x
+        y2 = y2 * self.display_scale + self.pan_y
         if self._crop_rect_id:
             self.canvas.delete(self._crop_rect_id)
         self._crop_rect_id = self.canvas.create_rectangle(
@@ -733,27 +741,27 @@ class App(tk.Tk):
     def _draw_clicks(self) -> None:
         for idx, pt in enumerate(self.click_points):
             x, y = pt
-            x *= self.display_scale
-            y *= self.display_scale
+            x = x * self.display_scale + self.pan_x
+            y = y * self.display_scale + self.pan_y
             color = "#ffcc00" if idx == 0 else "#00ccff"
             self.canvas.create_oval(x - 4, y - 4, x + 4, y + 4, fill=color, outline="black")
         if self.refine_point:
             x, y = self.refine_point
-            x *= self.display_scale
-            y *= self.display_scale
+            x = x * self.display_scale + self.pan_x
+            y = y * self.display_scale + self.pan_y
             self.canvas.create_oval(x - 4, y - 4, x + 4, y + 4, fill="#ff66cc", outline="black")
 
     def on_canvas_click(self, event: tk.Event) -> None:
         if not self.page_image:
             return
         self._dragging = True
-        self._drag_start = (event.x / self.display_scale, event.y / self.display_scale)
+        self._drag_start = self._screen_to_image(event.x, event.y)
 
     def on_canvas_drag(self, event: tk.Event) -> None:
         if not self._dragging or not self._drag_start:
             return
         x0, y0 = self._drag_start
-        x1, y1 = event.x / self.display_scale, event.y / self.display_scale
+        x1, y1 = self._screen_to_image(event.x, event.y)
         self.crop_box = (
             int(min(x0, x1)),
             int(min(y0, y1)),
@@ -767,9 +775,23 @@ class App(tk.Tk):
         if not self.page_image or not self.crop_box:
             return
         x0, y0 = self._drag_start or (0, 0)
-        x1, y1 = event.x / self.display_scale, event.y / self.display_scale
+        x1, y1 = self._screen_to_image(event.x, event.y)
         if abs(x1 - x0) < 3 and abs(y1 - y0) < 3:
             self._add_control_point((x1, y1))
+
+    def on_pan_start(self, event: tk.Event) -> None:
+        self._pan_anchor = (event.x, event.y, self.pan_x, self.pan_y)
+
+    def on_pan_drag(self, event: tk.Event) -> None:
+        if not getattr(self, "_pan_anchor", None):
+            return
+        ax, ay, px, py = self._pan_anchor
+        self.pan_x = px + (event.x - ax)
+        self.pan_y = py + (event.y - ay)
+        self._draw_image()
+
+    def on_pan_release(self, _event: tk.Event) -> None:
+        self._pan_anchor = None
 
     def on_zoom_in(self) -> None:
         self.zoom = min(self.zoom * 1.25, 6.0)
@@ -781,6 +803,8 @@ class App(tk.Tk):
 
     def on_zoom_fit(self) -> None:
         self.zoom = 1.0
+        self.pan_x = 0.0
+        self.pan_y = 0.0
         self._draw_image()
 
     def on_mouse_wheel(self, event: tk.Event) -> None:
@@ -788,6 +812,9 @@ class App(tk.Tk):
             self.on_zoom_in()
         else:
             self.on_zoom_out()
+
+    def _screen_to_image(self, x: float, y: float) -> Tuple[float, float]:
+        return ((x - self.pan_x) / self.display_scale, (y - self.pan_y) / self.display_scale)
 
     def _add_control_point(self, pt: Tuple[float, float]) -> None:
         if len(self.click_points) < 2:
@@ -828,7 +855,7 @@ class App(tk.Tk):
         self.canvas.bind("<Button-1>", self._capture_refine_click, add="+")
 
     def _capture_refine_click(self, event: tk.Event) -> None:
-        self.refine_point = (event.x / self.display_scale, event.y / self.display_scale)
+        self.refine_point = self._screen_to_image(event.x, event.y)
         self.canvas.unbind("<Button-1>", self._capture_refine_click)
         self._draw_image()
 

@@ -554,6 +554,9 @@ class App(tk.Tk):
             return None
         url = f"{APRA_BASE}{path}"
         resp = requests.get(url, params=params, headers=headers, timeout=30)
+        if resp.status_code == 404 and not url.endswith("/"):
+            url = url + "/"
+            resp = requests.get(url, params=params, headers=headers, timeout=30)
         resp.raise_for_status()
         return resp
 
@@ -862,12 +865,16 @@ class App(tk.Tk):
             {"edition": "current"},
             {"edition": "CURRENT", "geoname": "US"},
             {"edition": "CURRENT"},
+            {"edition": "next", "geoname": "US"},
+            {"edition": "next"},
         ]
 
         charts: List[TppChart] = []
         last_error: Optional[Exception] = None
+        tried: List[Dict[str, str]] = []
         for params in params_list:
             try:
+                tried.append(params)
                 resp = self._apra_get("/dtpp/chart", params=params)
                 if resp is None:
                     continue
@@ -883,7 +890,10 @@ class App(tk.Tk):
                 raise
 
         if not charts and last_error:
-            raise last_error
+            raise RuntimeError(
+                f"APRA dtpp/chart returned 404 for all params: {tried}. "
+                "Check APRA credentials or endpoint access."
+            ) from last_error
 
         # Filter by airport ident if present
         filtered = [c for c in charts if c.airport_id.upper() == apt.ident.upper()]

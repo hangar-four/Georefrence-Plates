@@ -31,6 +31,7 @@ DATA_DIR = Path("data")
 NASR_DIR = DATA_DIR / "nasr"
 CACHE_DIR = DATA_DIR / "cache"
 LAST_NASR_DATE_FILE = DATA_DIR / "last_nasr_date.txt"
+APRA_CONFIG_FILE = DATA_DIR / "apra_config.json"
 
 DPI = 400
 DEFAULT_OUTPUT_DIR = Path("output")
@@ -160,6 +161,7 @@ class App(tk.Tk):
 
         self._build_ui()
         self._load_last_nasr_date()
+        self._load_apra_config()
 
     def _build_ui(self) -> None:
         self.columnconfigure(0, weight=1)
@@ -172,28 +174,31 @@ class App(tk.Tk):
         ttk.Button(top, text="Update NASR", command=self.on_update_nasr).grid(
             row=0, column=0, padx=(0, 10)
         )
-        ttk.Label(top, text="NASR date:").grid(row=0, column=1, sticky="w")
+        ttk.Button(top, text="APRA Keys", command=self.on_apra_keys).grid(
+            row=0, column=1, padx=(0, 10)
+        )
+        ttk.Label(top, text="NASR date:").grid(row=0, column=2, sticky="w")
         self.nasr_date_var = tk.StringVar(value="")
         ttk.Entry(top, textvariable=self.nasr_date_var, width=12).grid(
-            row=0, column=2, padx=(4, 12)
+            row=0, column=3, padx=(4, 12)
         )
 
         ttk.Button(top, text="Load PDF", command=self.on_load_pdf).grid(
-            row=0, column=3, padx=(0, 10)
+            row=0, column=4, padx=(0, 10)
         )
 
-        ttk.Label(top, text="Search Airport:").grid(row=0, column=4, sticky="w")
+        ttk.Label(top, text="Search Airport:").grid(row=0, column=5, sticky="w")
         self.search_var = tk.StringVar(value="")
         search_entry = ttk.Entry(top, textvariable=self.search_var)
-        search_entry.grid(row=0, column=5, sticky="ew", padx=(4, 10))
+        search_entry.grid(row=0, column=6, sticky="ew", padx=(4, 10))
         search_entry.bind("<KeyRelease>", lambda _e: self.on_search())
 
-        ttk.Label(top, text="Runway:").grid(row=0, column=6, sticky="w")
+        ttk.Label(top, text="Runway:").grid(row=0, column=7, sticky="w")
         self.runway_var = tk.StringVar(value="")
         self.runway_combo = ttk.Combobox(
             top, textvariable=self.runway_var, state="readonly", width=12
         )
-        self.runway_combo.grid(row=0, column=7, sticky="w")
+        self.runway_combo.grid(row=0, column=8, sticky="w")
         self.runway_combo.bind("<<ComboboxSelected>>", lambda _e: self.on_runway_select())
 
         mid = ttk.Panedwindow(self, orient=tk.HORIZONTAL)
@@ -303,6 +308,90 @@ class App(tk.Tk):
     def _load_last_nasr_date(self) -> None:
         if LAST_NASR_DATE_FILE.exists():
             self.nasr_date_var.set(LAST_NASR_DATE_FILE.read_text(encoding="utf-8").strip())
+
+    def _load_apra_config(self) -> None:
+        if not APRA_CONFIG_FILE.exists():
+            return
+        try:
+            data = json.loads(APRA_CONFIG_FILE.read_text(encoding="utf-8"))
+        except Exception:
+            return
+        # Do not log secrets.
+        for key in (
+            "APRA_CLIENT_ID",
+            "APRA_CLIENT_SECRET",
+            "APRA_CLIENT_ID_HEADER",
+            "APRA_CLIENT_SECRET_HEADER",
+            "APRA_API_KEY",
+            "APRA_API_KEY_HEADER",
+            "APRA_BASE_URL",
+            "APRA_TOKEN_URL",
+            "APRA_SCOPE",
+        ):
+            val = data.get(key)
+            if isinstance(val, str) and val:
+                os.environ[key] = val
+
+    def _save_apra_config(self, data: Dict[str, str]) -> None:
+        DATA_DIR.mkdir(parents=True, exist_ok=True)
+        APRA_CONFIG_FILE.write_text(json.dumps(data, indent=2), encoding="utf-8")
+
+    def on_apra_keys(self) -> None:
+        win = tk.Toplevel(self)
+        win.title("APRA Credentials")
+        win.geometry("520x360")
+        win.grab_set()
+
+        def row(label: str, var: tk.StringVar, r: int, show: Optional[str] = None) -> None:
+            ttk.Label(win, text=label).grid(row=r, column=0, sticky="w", padx=10, pady=6)
+            ttk.Entry(win, textvariable=var, width=48, show=show).grid(
+                row=r, column=1, sticky="ew", padx=10, pady=6
+            )
+
+        win.columnconfigure(1, weight=1)
+        v_client_id = tk.StringVar(value=os.environ.get("APRA_CLIENT_ID", ""))
+        v_client_secret = tk.StringVar(value=os.environ.get("APRA_CLIENT_SECRET", ""))
+        v_id_header = tk.StringVar(value=os.environ.get("APRA_CLIENT_ID_HEADER", "client_id"))
+        v_secret_header = tk.StringVar(value=os.environ.get("APRA_CLIENT_SECRET_HEADER", "client_secret"))
+        v_api_key = tk.StringVar(value=os.environ.get("APRA_API_KEY", ""))
+        v_api_key_header = tk.StringVar(value=os.environ.get("APRA_API_KEY_HEADER", "x-api-key"))
+        v_base_url = tk.StringVar(value=os.environ.get("APRA_BASE_URL", APRA_BASE))
+        v_token_url = tk.StringVar(value=os.environ.get("APRA_TOKEN_URL", ""))
+        v_scope = tk.StringVar(value=os.environ.get("APRA_SCOPE", ""))
+
+        row("Client ID", v_client_id, 0)
+        row("Client Secret", v_client_secret, 1, show="*")
+        row("Client ID Header", v_id_header, 2)
+        row("Client Secret Header", v_secret_header, 3)
+        row("API Key", v_api_key, 4, show="*")
+        row("API Key Header", v_api_key_header, 5)
+        row("APRA Base URL", v_base_url, 6)
+        row("Token URL (optional)", v_token_url, 7)
+        row("Scope (optional)", v_scope, 8)
+
+        def save() -> None:
+            data = {
+                "APRA_CLIENT_ID": v_client_id.get().strip(),
+                "APRA_CLIENT_SECRET": v_client_secret.get().strip(),
+                "APRA_CLIENT_ID_HEADER": v_id_header.get().strip(),
+                "APRA_CLIENT_SECRET_HEADER": v_secret_header.get().strip(),
+                "APRA_API_KEY": v_api_key.get().strip(),
+                "APRA_API_KEY_HEADER": v_api_key_header.get().strip(),
+                "APRA_BASE_URL": v_base_url.get().strip(),
+                "APRA_TOKEN_URL": v_token_url.get().strip(),
+                "APRA_SCOPE": v_scope.get().strip(),
+            }
+            # Apply immediately
+            for k, v in data.items():
+                if v:
+                    os.environ[k] = v
+                elif k in os.environ:
+                    del os.environ[k]
+            self._save_apra_config(data)
+            win.destroy()
+
+        ttk.Button(win, text="Save", command=save).grid(row=9, column=0, pady=12, padx=10, sticky="w")
+        ttk.Button(win, text="Cancel", command=win.destroy).grid(row=9, column=1, pady=12, padx=10, sticky="e")
 
     def on_browse(self) -> None:
         folder = filedialog.askdirectory(initialdir=self.output_var.get())

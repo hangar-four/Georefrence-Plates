@@ -3,6 +3,7 @@
 output/
 data/cache/
 data/cycles/
+data/apra_config.json
 dist/
 build/
 *.spec

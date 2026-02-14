@@ -38,6 +38,9 @@ pull NASR data through the API instead of the public download page:
 
 If none are set, the app falls back to the public NASR download.
 
+You can also enter APRA credentials directly in the app using the **APRA Keys**
+button. These are saved locally in `data/apra_config.json`.
+
 ## Output and cache
 
 - KMZ files go to the folder you select in the UI.

@@ -391,7 +391,20 @@ class App(tk.Tk):
         cycles = re.findall(r">(\d{4})<", resp.text)
         if not cycles:
             raise RuntimeError("No cycles found on FAA d-TPP index.")
-        return max(cycles)
+        # Prefer the newest cycle that actually has the metafile.
+        for cycle in sorted(set(cycles), reverse=True):
+            meta_url = f"{FAA_BASE}/{cycle}/xml_data/d-TPP_Metafile.xml"
+            try:
+                head = requests.head(meta_url, timeout=15, allow_redirects=True)
+                if head.status_code == 200:
+                    return cycle
+                if head.status_code in (403, 405):
+                    get = requests.get(meta_url, stream=True, timeout=15)
+                    if get.status_code == 200:
+                        return cycle
+            except requests.RequestException:
+                continue
+        raise RuntimeError("No cycles with d-TPP_Metafile.xml found.")
 
     def _download_metafile(self, cycle: str) -> Path:
         CYCLES_DIR.mkdir(parents=True, exist_ok=True)

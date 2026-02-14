@@ -440,15 +440,55 @@ class App(tk.Tk):
             raise RuntimeError("GDAL install failed or tools not found.")
 
     def _get_latest_gdal_zip_url(self) -> str:
-        resp = requests.get(GISINTERNALS_RELEASE_URL, timeout=30)
-        resp.raise_for_status()
-        matches = re.findall(r"(release-(\d+)-x64-gdal-[^\"<>\s]+)", resp.text)
-        if not matches:
+        candidates = self._get_gdal_candidates()
+        if not candidates:
             raise RuntimeError("Could not find GDAL download on GISInternals.")
-        best = max(matches, key=lambda m: int(m[1]))[0]
-        if not best.endswith(".zip"):
-            best = best + ".zip"
-        return f"{GISINTERNALS_BASE}/{best}"
+        for name in candidates:
+            url = self._resolve_gdal_url(name)
+            if url:
+                return url
+        raise RuntimeError("Could not resolve a working GDAL download URL.")
+
+    def _get_gdal_candidates(self) -> List[str]:
+        pages = [
+            GISINTERNALS_RELEASE_URL,
+            "https://download.gisinternals.com/release.php",
+            "https://download.gisinternals.com/stable.php",
+        ]
+        found = []
+        for page in pages:
+            try:
+                resp = requests.get(page, timeout=30)
+                resp.raise_for_status()
+                matches = re.findall(r"(release-(\d+)-x64-gdal-[^\"<>\s]+)", resp.text)
+                found.extend(matches)
+            except requests.RequestException:
+                continue
+        unique = {name: int(num) for name, num in found}
+        return [k for k, _ in sorted(unique.items(), key=lambda kv: kv[1], reverse=True)]
+
+    def _resolve_gdal_url(self, name: str) -> Optional[str]:
+        base_names = [name] if name.endswith(".zip") else [name, name + ".zip"]
+        bases = [
+            GISINTERNALS_BASE,
+            "https://download.gisinternals.com/release",
+            "https://download.gisinternals.com/stable",
+            "https://download.gisinternals.com/download",
+        ]
+        for base in bases:
+            for n in base_names:
+                url = f"{base}/{n}"
+                try:
+                    head = requests.head(url, timeout=15, allow_redirects=True)
+                    if head.status_code == 200:
+                        return url
+                    if head.status_code in (403, 405):
+                        get = requests.get(url, stream=True, timeout=15)
+                        if get.status_code == 200:
+                            return url
+                except requests.RequestException:
+                    continue
+        return None
 
     def _download_and_install_gdal(self) -> None:
         APP_DATA_DIR.mkdir(parents=True, exist_ok=True)

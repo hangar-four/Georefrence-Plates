@@ -468,7 +468,34 @@ class App(tk.Tk):
         return [k for k, _ in sorted(unique.items(), key=lambda kv: kv[1], reverse=True)]
 
     def _resolve_gdal_url(self, name: str) -> Optional[str]:
-        base_names = [name] if name.endswith(".zip") else [name, name + ".zip"]
+        file_name = name if name.endswith(".zip") else name + ".zip"
+        query_url = f"{GISINTERNALS_BASE}/query.html?content=filelist&file={file_name}"
+        try:
+            resp = requests.get(query_url, timeout=20)
+            if resp.status_code == 200:
+                content_type = resp.headers.get("content-type", "").lower()
+                if "zip" in content_type:
+                    return query_url
+                # Look for direct download links in the file list page.
+                links = re.findall(r'href="([^"]+)"', resp.text)
+                links += re.findall(r"(https?://[^\\s\"']+)", resp.text)
+                candidates = []
+                for link in links:
+                    if file_name not in link:
+                        continue
+                    if link.startswith("http"):
+                        candidates.append(link)
+                    elif link.startswith("/"):
+                        candidates.append(f"{GISINTERNALS_BASE}{link}")
+                    else:
+                        candidates.append(f"{GISINTERNALS_BASE}/{link}")
+                for url in candidates:
+                    if self._url_exists(url):
+                        return url
+        except requests.RequestException:
+            pass
+
+        base_names = [file_name]
         bases = [
             GISINTERNALS_BASE,
             "https://download.gisinternals.com/release",
@@ -478,17 +505,21 @@ class App(tk.Tk):
         for base in bases:
             for n in base_names:
                 url = f"{base}/{n}"
-                try:
-                    head = requests.head(url, timeout=15, allow_redirects=True)
-                    if head.status_code == 200:
-                        return url
-                    if head.status_code in (403, 405):
-                        get = requests.get(url, stream=True, timeout=15)
-                        if get.status_code == 200:
-                            return url
-                except requests.RequestException:
-                    continue
+                if self._url_exists(url):
+                    return url
         return None
+
+    def _url_exists(self, url: str) -> bool:
+        try:
+            head = requests.head(url, timeout=15, allow_redirects=True)
+            if head.status_code == 200:
+                return True
+            if head.status_code in (403, 405):
+                get = requests.get(url, stream=True, timeout=15)
+                return get.status_code == 200
+        except requests.RequestException:
+            return False
+        return False
 
     def _download_and_install_gdal(self) -> None:
         APP_DATA_DIR.mkdir(parents=True, exist_ok=True)

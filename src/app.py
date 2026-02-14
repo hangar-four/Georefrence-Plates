@@ -469,29 +469,34 @@ class App(tk.Tk):
 
     def _resolve_gdal_url(self, name: str) -> Optional[str]:
         file_name = name if name.endswith(".zip") else name + ".zip"
-        query_url = f"{GISINTERNALS_BASE}/query.html?content=filelist&file={file_name}"
+        query_urls = [
+            f"{GISINTERNALS_BASE}/query.html?content=filelist&file={file_name}",
+            f"https://www.gisinternals.com/query.html?content=filelist&file={file_name}",
+            f"http://www.gisinternals.com/query.html?content=filelist&file={file_name}",
+        ]
         try:
-            resp = requests.get(query_url, timeout=20)
-            if resp.status_code == 200:
-                content_type = resp.headers.get("content-type", "").lower()
-                if "zip" in content_type:
-                    return query_url
-                # Look for direct download links in the file list page.
-                links = re.findall(r'href="([^"]+)"', resp.text)
-                links += re.findall(r"(https?://[^\\s\"']+)", resp.text)
-                candidates = []
-                for link in links:
-                    if file_name not in link:
-                        continue
-                    if link.startswith("http"):
-                        candidates.append(link)
-                    elif link.startswith("/"):
-                        candidates.append(f"{GISINTERNALS_BASE}{link}")
-                    else:
-                        candidates.append(f"{GISINTERNALS_BASE}/{link}")
-                for url in candidates:
-                    if self._url_exists(url):
-                        return url
+            for query_url in query_urls:
+                resp = requests.get(query_url, timeout=20)
+                if resp.status_code == 200:
+                    content_type = resp.headers.get("content-type", "").lower()
+                    if "zip" in content_type:
+                        return query_url
+                    # Look for direct download links in the file list page.
+                    links = re.findall(r'href="([^"]+)"', resp.text)
+                    links += re.findall(r"(https?://[^\\s\"']+)", resp.text)
+                    candidates = []
+                    for link in links:
+                        if file_name not in link:
+                            continue
+                        if link.startswith("http"):
+                            candidates.append(link)
+                        elif link.startswith("/"):
+                            candidates.append(f"{GISINTERNALS_BASE}{link}")
+                        else:
+                            candidates.append(f"{GISINTERNALS_BASE}/{link}")
+                    for url in candidates:
+                        if self._url_exists(url):
+                            return url
         except requests.RequestException:
             pass
 

@@ -1,0 +1,5 @@
+﻿__pycache__/
+.venv/
+output/
+data/cache/
+data/cycles/

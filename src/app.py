@@ -4,14 +4,18 @@ import io
 import json
 import math
 import os
+import pickle
 import re
 import shutil
+import subprocess
 import tempfile
 import time
 import threading
 import zipfile
+import xml.etree.ElementTree as ET
 from dataclasses import dataclass
 from datetime import datetime
+from queue import Queue
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
@@ -26,10 +30,13 @@ import numpy as np
 
 NASR_INDEX_URL = "https://www.faa.gov/air_traffic/flight_info/aeronav/aero_data/NASR_Subscription/"
 NASR_ZIP_TEMPLATE = "https://nfdc.faa.gov/webContent/28DaySub/28DaySubscription_Effective_{date}.zip"
-APRA_BASE = os.environ.get("APRA_BASE_URL", "https://external-api.faa.gov/apra")
+DEFAULT_APRA_BASE = "https://external-api.faa.gov/apra"
 DATA_DIR = Path("data")
 NASR_DIR = DATA_DIR / "nasr"
 CACHE_DIR = DATA_DIR / "cache"
+TPP_DIR = DATA_DIR / "tpp"
+CHARTS_DIR = DATA_DIR / "charts"
+TPP_INDEX_FILE = DATA_DIR / "tpp_index.json"
 LAST_NASR_DATE_FILE = DATA_DIR / "last_nasr_date.txt"
 APRA_CONFIG_FILE = DATA_DIR / "apra_config.json"
 
@@ -136,6 +143,10 @@ class App(tk.Tk):
         super().__init__()
         self.title("FAA Plate Georef (Runway-Click)")
         self.geometry("1200x820")
+        try:
+            self.state("zoomed")
+        except Exception:
+            pass
 
         self.airports: Dict[str, Airport] = {}
         self.filtered_airports: List[Airport] = []
@@ -144,6 +155,7 @@ class App(tk.Tk):
         self.fixes: List[FixPoint] = []
         self.nearby_fixes: List[FixPoint] = []
         self.tpp_charts: List[TppChart] = []
+        self.current_chart_name: str = ""
 
         self.pdf_path: Optional[Path] = None
         self.page_image: Optional[Image.Image] = None
@@ -155,17 +167,21 @@ class App(tk.Tk):
         self.tk_image: Optional[ImageTk.PhotoImage] = None
 
         self.click_points: List[Tuple[float, float]] = []
-        self.refine_point: Optional[Tuple[float, float]] = None
+        self.refine_points: List[Tuple[Tuple[float, float], FixPoint]] = []
+        self._pending_refine_fix: Optional[FixPoint] = None
+        self._target_circle_id: Optional[int] = None
         self._apra_token: Optional[str] = None
         self._apra_token_expiry: float = 0.0
+        self.geo_results: List[Dict[str, str]] = []
 
         self._build_ui()
         self._load_last_nasr_date()
         self._load_apra_config()
+        self._refresh_status()
 
     def _build_ui(self) -> None:
         self.columnconfigure(0, weight=1)
-        self.rowconfigure(2, weight=1)
+        self.rowconfigure(1, weight=1)
 
         top = ttk.Frame(self)
         top.grid(row=0, column=0, sticky="ew", padx=10, pady=8)
@@ -201,21 +217,28 @@ class App(tk.Tk):
         self.runway_combo.grid(row=0, column=8, sticky="w")
         self.runway_combo.bind("<<ComboboxSelected>>", lambda _e: self.on_runway_select())
 
-        mid = ttk.Panedwindow(self, orient=tk.HORIZONTAL)
-        mid.grid(row=1, column=0, sticky="nsew", padx=10, pady=(0, 6))
+        plate_tab = ttk.Frame(self)
+        plate_tab.grid(row=1, column=0, sticky="nsew", padx=10, pady=(0, 6))
+        plate_tab.columnconfigure(0, weight=1)
+        plate_tab.rowconfigure(0, weight=1)
+        plate_tab.rowconfigure(2, weight=1)
+
+        mid = ttk.Panedwindow(plate_tab, orient=tk.HORIZONTAL)
+        mid.grid(row=0, column=0, sticky="nsew", pady=(0, 6))
 
         left = ttk.Frame(mid)
         left.columnconfigure(0, weight=1)
         left.rowconfigure(1, weight=1)
+        left.rowconfigure(3, weight=1)
         mid.add(left, weight=1)
 
         ttk.Label(left, text="Airports").grid(row=0, column=0, sticky="w")
-        self.airport_list = tk.Listbox(left, height=14)
+        self.airport_list = tk.Listbox(left)
         self.airport_list.grid(row=1, column=0, sticky="nsew")
         self.airport_list.bind("<<ListboxSelect>>", lambda _e: self.on_airport_select())
 
         ttk.Label(left, text="Approaches").grid(row=2, column=0, sticky="w", pady=(6, 0))
-        self.tpp_list = tk.Listbox(left, height=10)
+        self.tpp_list = tk.Listbox(left)
         self.tpp_list.grid(row=3, column=0, sticky="nsew")
         ttk.Button(left, text="Fetch Approaches", command=self.on_fetch_tpp).grid(
             row=4, column=0, sticky="ew", pady=(6, 0)
@@ -243,11 +266,13 @@ class App(tk.Tk):
         self.canvas.bind("<B2-Motion>", self.on_pan_drag)
         self.canvas.bind("<ButtonRelease-2>", self.on_pan_release)
         self.canvas.bind("<MouseWheel>", self.on_mouse_wheel)
+        self.canvas.bind("<Motion>", self.on_canvas_motion)
+        self.canvas.bind("<Leave>", lambda _e: self._hide_target_cursor())
         self.canvas.bind("<Configure>", lambda _e: self._draw_image())
 
-        controls = ttk.Frame(self)
-        controls.grid(row=2, column=0, sticky="ew", padx=10)
-        controls.columnconfigure(6, weight=1)
+        controls = ttk.Frame(plate_tab)
+        controls.grid(row=1, column=0, sticky="ew")
+        controls.columnconfigure(9, weight=1)
 
         self.instruction_var = tk.StringVar(value="Load a PDF to start.")
         ttk.Label(controls, textvariable=self.instruction_var).grid(
@@ -257,9 +282,10 @@ class App(tk.Tk):
         ttk.Label(controls, text="Refine fix:").grid(row=1, column=0, sticky="w", pady=(6, 0))
         self.fix_var = tk.StringVar(value="None")
         self.fix_combo = ttk.Combobox(
-            controls, textvariable=self.fix_var, state="readonly", width=24
+            controls, textvariable=self.fix_var, state="normal", width=24
         )
         self.fix_combo.grid(row=1, column=1, sticky="w", pady=(6, 0))
+        self.fix_combo.bind("<KeyRelease>", lambda _e: self.on_fix_search())
         ttk.Button(controls, text="Refine", command=self.on_refine).grid(
             row=1, column=2, sticky="w", padx=(6, 0), pady=(6, 0)
         )
@@ -275,6 +301,16 @@ class App(tk.Tk):
             row=1, column=5, sticky="w", padx=(6, 0), pady=(6, 0)
         )
 
+        self.show_target_var = tk.BooleanVar(value=True)
+        self.target_radius_var = tk.IntVar(value=16)
+        ttk.Checkbutton(
+            controls, text="Waypoint target circle", variable=self.show_target_var
+        ).grid(row=1, column=6, sticky="w", padx=(12, 0), pady=(6, 0))
+        ttk.Label(controls, text="px:").grid(row=1, column=7, sticky="e", pady=(6, 0))
+        ttk.Spinbox(
+            controls, from_=6, to=60, width=5, textvariable=self.target_radius_var
+        ).grid(row=1, column=8, sticky="w", pady=(6, 0))
+
         ttk.Button(controls, text="Generate KMZ", command=self.on_generate).grid(
             row=0, column=5, sticky="e"
         )
@@ -288,8 +324,14 @@ class App(tk.Tk):
             row=0, column=8, sticky="e", padx=(4, 0)
         )
 
-        log_frame = ttk.Frame(self)
-        log_frame.grid(row=3, column=0, sticky="nsew", padx=10, pady=(6, 10))
+        status_frame = ttk.Frame(plate_tab)
+        status_frame.grid(row=3, column=0, sticky="ew", pady=(4, 0))
+        ttk.Label(status_frame, text="Session status:").grid(row=0, column=0, sticky="w")
+        self.status_var = tk.StringVar(value="")
+        ttk.Label(status_frame, textvariable=self.status_var).grid(row=0, column=1, sticky="w", padx=(8, 0))
+
+        log_frame = ttk.Frame(plate_tab)
+        log_frame.grid(row=2, column=0, sticky="nsew", pady=(6, 0))
         log_frame.rowconfigure(0, weight=1)
         log_frame.columnconfigure(0, weight=1)
 
@@ -300,6 +342,56 @@ class App(tk.Tk):
         self._drag_start = None
         self._crop_rect_id = None
         self._pan_anchor = None
+        self._refine_bind_id: Optional[str] = None
+
+        # GeoTIFF tab intentionally disabled for now.
+
+    def _build_geo_tab(self, parent: ttk.Frame) -> None:
+        frm = ttk.Frame(parent)
+        frm.grid(row=0, column=0, sticky="ew", padx=6, pady=6)
+        for c in range(8):
+            frm.columnconfigure(c, weight=0)
+        frm.columnconfigure(7, weight=1)
+
+        ttk.Label(frm, text="Product").grid(row=0, column=0, sticky="w")
+        self.geo_product_var = tk.StringVar(value="IFR Enroute")
+        self.geo_product_combo = ttk.Combobox(
+            frm,
+            textvariable=self.geo_product_var,
+            state="readonly",
+            values=["IFR Enroute", "IFR Planning", "VFR Sectional", "VFR TAC"],
+            width=16,
+        )
+        self.geo_product_combo.grid(row=0, column=1, sticky="w", padx=(4, 8))
+        self.geo_product_combo.bind("<<ComboboxSelected>>", lambda _e: self._geo_product_changed())
+
+        ttk.Label(frm, text="Edition").grid(row=0, column=2, sticky="w")
+        self.geo_edition_var = tk.StringVar(value="current")
+        ttk.Combobox(
+            frm, textvariable=self.geo_edition_var, state="readonly", values=["current", "next"], width=10
+        ).grid(row=0, column=3, sticky="w", padx=(4, 8))
+
+        ttk.Label(frm, text="Geoname").grid(row=0, column=4, sticky="w")
+        self.geo_geoname_var = tk.StringVar(value="US")
+        self.geo_geoname_combo = ttk.Combobox(frm, textvariable=self.geo_geoname_var, width=24)
+        self.geo_geoname_combo.grid(row=0, column=5, sticky="w", padx=(4, 8))
+
+        ttk.Label(frm, text="Series").grid(row=0, column=6, sticky="w")
+        self.geo_series_var = tk.StringVar(value="low")
+        self.geo_series_combo = ttk.Combobox(
+            frm, textvariable=self.geo_series_var, state="readonly", values=["low", "high", "area"], width=10
+        )
+        self.geo_series_combo.grid(row=0, column=7, sticky="w", padx=(4, 8))
+
+        btns = ttk.Frame(parent)
+        btns.grid(row=1, column=0, sticky="ew", padx=6, pady=(0, 6))
+        ttk.Button(btns, text="Fetch GeoTIFF Links", command=self.on_geo_fetch).grid(row=0, column=0, padx=(0, 8))
+        ttk.Button(btns, text="Download Selected", command=self.on_geo_download_selected).grid(row=0, column=1, padx=(0, 8))
+        ttk.Button(btns, text="Download + Export KMZ", command=self.on_geo_download_export_kmz).grid(row=0, column=2)
+
+        self.geo_list = tk.Listbox(parent)
+        self.geo_list.grid(row=2, column=0, sticky="nsew", padx=6, pady=(0, 6))
+        self._geo_product_changed()
 
     def _log(self, msg: str) -> None:
         self.log_text.insert("end", msg + "\n")
@@ -355,7 +447,7 @@ class App(tk.Tk):
         v_secret_header = tk.StringVar(value=os.environ.get("APRA_CLIENT_SECRET_HEADER", "client_secret"))
         v_api_key = tk.StringVar(value=os.environ.get("APRA_API_KEY", ""))
         v_api_key_header = tk.StringVar(value=os.environ.get("APRA_API_KEY_HEADER", "x-api-key"))
-        v_base_url = tk.StringVar(value=os.environ.get("APRA_BASE_URL", APRA_BASE))
+        v_base_url = tk.StringVar(value=os.environ.get("APRA_BASE_URL", DEFAULT_APRA_BASE))
         v_token_url = tk.StringVar(value=os.environ.get("APRA_TOKEN_URL", ""))
         v_scope = tk.StringVar(value=os.environ.get("APRA_SCOPE", ""))
 
@@ -388,6 +480,7 @@ class App(tk.Tk):
                 elif k in os.environ:
                     del os.environ[k]
             self._save_apra_config(data)
+            self._refresh_status()
             win.destroy()
 
         ttk.Button(win, text="Save", command=save).grid(row=9, column=0, pady=12, padx=10, sticky="w")
@@ -413,20 +506,38 @@ class App(tk.Tk):
             zip_path = self._download_nasr_zip(date)
             self._log(f"Saved: {zip_path}")
 
-            self._log("Parsing NASR CSVs...")
-            self.airports, self.fixes = self._parse_nasr(zip_path)
+            cache_path = self._nasr_cache_path(date)
+            if cache_path.exists():
+                self._log(f"Loading NASR cache: {cache_path.name}...")
+                self.airports, self.fixes = self._load_nasr_cache(cache_path)
+            else:
+                self._log("Parsing NASR CSVs...")
+                self.airports, self.fixes = self._parse_nasr(zip_path)
+                self._save_nasr_cache(cache_path, self.airports, self.fixes)
+                self._log(f"Saved NASR cache: {cache_path.name}")
             self._log(f"Loaded {len(self.airports)} airports, {len(self.fixes)} fixes/navs.")
+            self._refresh_status()
             self.on_search()
         except Exception as exc:
             if "not a zip" in str(exc).lower():
                 zip_path = self._prompt_for_nasr_zip()
                 if zip_path:
                     try:
-                        self._log("Parsing NASR CSVs...")
-                        self.airports, self.fixes = self._parse_nasr(zip_path)
+                        date = self._date_from_filename(zip_path.name) or self.nasr_date_var.get().strip()
+                        cache_path = self._nasr_cache_path(date) if date else None
+                        if cache_path and cache_path.exists():
+                            self._log(f"Loading NASR cache: {cache_path.name}...")
+                            self.airports, self.fixes = self._load_nasr_cache(cache_path)
+                        else:
+                            self._log("Parsing NASR CSVs...")
+                            self.airports, self.fixes = self._parse_nasr(zip_path)
+                            if cache_path:
+                                self._save_nasr_cache(cache_path, self.airports, self.fixes)
+                                self._log(f"Saved NASR cache: {cache_path.name}")
                         self._log(
                             f"Loaded {len(self.airports)} airports, {len(self.fixes)} fixes/navs."
                         )
+                        self._refresh_status()
                         self.on_search()
                         return
                     except Exception as exc2:
@@ -435,6 +546,30 @@ class App(tk.Tk):
                         return
             self._log(f"Error: {exc}")
             messagebox.showerror("NASR Update Failed", str(exc))
+
+    def _nasr_cache_path(self, date: str) -> Path:
+        safe = date.strip().replace("/", "-")
+        return NASR_DIR / f"NASR_{safe}.pkl"
+
+    def _date_from_filename(self, name: str) -> Optional[str]:
+        match = re.search(r"(\d{4}-\d{2}-\d{2})", name)
+        if match:
+            return match.group(1)
+        return None
+
+    def _save_nasr_cache(self, path: Path, airports: Dict[str, Airport], fixes: List[FixPoint]) -> None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with open(path, "wb") as f:
+            pickle.dump({"airports": airports, "fixes": fixes}, f, protocol=pickle.HIGHEST_PROTOCOL)
+
+    def _load_nasr_cache(self, path: Path) -> Tuple[Dict[str, Airport], List[FixPoint]]:
+        with open(path, "rb") as f:
+            data = pickle.load(f)
+        airports = data.get("airports")
+        fixes = data.get("fixes")
+        if not isinstance(airports, dict) or not isinstance(fixes, list):
+            raise RuntimeError("Invalid NASR cache format.")
+        return airports, fixes
 
     def _prompt_for_nasr_zip(self) -> Optional[Path]:
         answer = messagebox.askyesno(
@@ -552,13 +687,17 @@ class App(tk.Tk):
         headers = self._apra_headers()
         if headers is None:
             return None
-        url = f"{APRA_BASE}{path}"
+        base = self._apra_base().rstrip("/")
+        url = f"{base}{path}"
         resp = requests.get(url, params=params, headers=headers, timeout=30)
         if resp.status_code == 404 and not url.endswith("/"):
             url = url + "/"
             resp = requests.get(url, params=params, headers=headers, timeout=30)
         resp.raise_for_status()
         return resp
+
+    def _apra_base(self) -> str:
+        return (os.environ.get("APRA_BASE_URL") or DEFAULT_APRA_BASE).strip()
 
     def _apra_headers(self) -> Optional[Dict[str, str]]:
         api_key = os.environ.get("APRA_API_KEY")
@@ -831,6 +970,22 @@ class App(tk.Tk):
         self.fix_var.set("None")
         self.nearby_fixes = nearby
 
+    def on_fix_search(self) -> None:
+        query = self.fix_var.get().strip().upper()
+        if not self.nearby_fixes:
+            return
+        if not query or query == "NONE":
+            labels = ["None"] + [f"{f.ident} ({f.kind})" for f in self.nearby_fixes]
+        else:
+            labels = ["None"] + [
+                f"{f.ident} ({f.kind})"
+                for f in self.nearby_fixes
+                if query in f.ident.upper() or query in f.kind.upper()
+            ]
+            if len(labels) == 1:
+                labels = ["None"] + [f"{f.ident} ({f.kind})" for f in self.nearby_fixes]
+        self.fix_combo["values"] = labels
+
     def on_fetch_tpp(self) -> None:
         if not self.selected_airport:
             messagebox.showwarning("Missing airport", "Select an airport first.")
@@ -840,64 +995,38 @@ class App(tk.Tk):
     def _fetch_tpp_worker(self) -> None:
         try:
             apt = self.selected_airport
-            self._log("Fetching TPP charts from APRA...")
+            self._log("Building/loading TPP index...")
             charts = self._fetch_tpp_charts(apt)
             self.tpp_charts = charts
             self.tpp_list.delete(0, "end")
             for c in charts:
                 self.tpp_list.insert("end", c.chart_name)
             self._log(f"Loaded {len(charts)} approach charts.")
+            self._refresh_status()
         except Exception as exc:
             self._log(f"Error: {exc}")
             messagebox.showerror("TPP Fetch Failed", str(exc))
 
     def _fetch_tpp_charts(self, apt: Airport) -> List[TppChart]:
-        if self._apra_headers() is None:
-            raise RuntimeError("APRA credentials not configured.")
-
-        state_code = apt.state.upper() if apt.state else ""
-        state_name = STATE_NAME_BY_CODE.get(state_code, "")
-        params_list = [
-            {"edition": "current", "geoname": state_name} if state_name else {"edition": "current"},
-            {"edition": "current", "geoname": state_name.upper()} if state_name else {"edition": "current"},
-            {"edition": "current", "geoname": state_code} if state_code else {"edition": "current"},
-            {"edition": "current", "geoname": "US"},
-            {"edition": "current"},
-            {"edition": "CURRENT", "geoname": "US"},
-            {"edition": "CURRENT"},
-            {"edition": "next", "geoname": "US"},
-            {"edition": "next"},
-        ]
-
+        index = self._ensure_tpp_index()
         charts: List[TppChart] = []
-        last_error: Optional[Exception] = None
-        tried: List[Dict[str, str]] = []
-        for params in params_list:
-            try:
-                tried.append(params)
-                resp = self._apra_get("/dtpp/chart", params=params)
-                if resp is None:
-                    continue
-                charts = self._parse_tpp_response(resp.text)
-                if charts:
-                    break
-            except requests.RequestException as exc:
-                last_error = exc
-                status = getattr(exc, "response", None).status_code if getattr(exc, "response", None) else None
-                if status == 404:
-                    self._log(f"TPP 404 for params: {params}")
-                    continue
-                raise
-
-        if not charts and last_error:
-            raise RuntimeError(
-                f"APRA dtpp/chart returned 404 for all params: {tried}. "
-                "Check APRA credentials or endpoint access."
-            ) from last_error
-
-        # Filter by airport ident if present
-        filtered = [c for c in charts if c.airport_id.upper() == apt.ident.upper()]
-        return filtered or charts
+        ident = apt.ident.upper()
+        for item in index.get("charts", []):
+            apt_ident = str(item.get("airport_id", "")).upper()
+            icao_ident = str(item.get("icao_id", "")).upper()
+            if ident and ident not in (apt_ident, icao_ident):
+                continue
+            url = str(item.get("url", "")).strip()
+            if not url:
+                continue
+            charts.append(
+                TppChart(
+                    airport_id=apt_ident or icao_ident,
+                    chart_name=str(item.get("chart_name", "")),
+                    url=url,
+                )
+            )
+        return charts
 
     def _parse_tpp_response(self, text: str) -> List[TppChart]:
         charts: List[TppChart] = []
@@ -937,12 +1066,260 @@ class App(tk.Tk):
             charts.append(TppChart(airport_id=airport_id, chart_name=chart_name, url=url))
         return charts
 
+    def _ensure_tpp_index(self) -> Dict[str, object]:
+        cached = self._load_tpp_index()
+        try:
+            current_info = self._fetch_dtpp_info()
+        except Exception as exc:
+            if cached:
+                self._log(f"Using cached TPP index (APRA unavailable): {exc}")
+                return cached
+            raise
+        if cached and current_info.get("edition_date") == cached.get("edition_date"):
+            return cached
+        if cached:
+            if not self._prompt_tpp_update(cached, current_info):
+                self._log("Keeping existing TPP cache.")
+                return cached
+            self._clear_tpp_cache()
+        index = self._build_tpp_index(current_info)
+        self._save_tpp_index(index)
+        return index
+
+    def _prompt_tpp_update(self, cached: Dict[str, object], current_info: Dict[str, object]) -> bool:
+        prev_date = str(cached.get("edition_date") or "unknown")
+        prev_generated = str(cached.get("generated") or "unknown")
+        new_date = str(current_info.get("edition_date") or "unknown")
+        msg = (
+            "A newer TPP edition is available.\n\n"
+            f"Cached edition date: {prev_date}\n"
+            f"Cached download time: {prev_generated}\n"
+            f"Newest edition date: {new_date}\n\n"
+            "Download newest now and delete old cached TPP zip files?"
+        )
+        return self._ask_yes_no("Update TPP Cache", msg)
+
+    def _ask_yes_no(self, title: str, message: str) -> bool:
+        # Ensure Tk dialog runs on the main thread even when called from worker thread.
+        if threading.current_thread() is threading.main_thread():
+            return messagebox.askyesno(title, message)
+        q: Queue[bool] = Queue()
+
+        def ask() -> None:
+            q.put(messagebox.askyesno(title, message))
+
+        self.after(0, ask)
+        return q.get()
+
+    def _clear_tpp_cache(self) -> None:
+        if TPP_INDEX_FILE.exists():
+            TPP_INDEX_FILE.unlink(missing_ok=True)
+        if TPP_DIR.exists():
+            for p in TPP_DIR.glob("DDTPP*.zip"):
+                p.unlink(missing_ok=True)
+        self._refresh_status()
+
+    def _fetch_dtpp_info(self) -> Dict[str, object]:
+        if self._apra_headers() is None:
+            raise RuntimeError("APRA credentials not configured.")
+        params_list = [
+            {"edition": "current", "geoname": "US"},
+            {"edition": "current"},
+            {"edition": "CURRENT", "geoname": "US"},
+            {"edition": "CURRENT"},
+        ]
+        last_error: Optional[Exception] = None
+        for params in params_list:
+            try:
+                resp = self._apra_get("/dtpp/info", params=params)
+                if resp is None:
+                    continue
+                info = self._parse_dtpp_info(resp.text)
+                if info.get("urls"):
+                    return info
+                # Some APRA tenants return edition metadata only on /dtpp/info.
+                chart_resp = self._apra_get("/dtpp/chart", params=params)
+                if chart_resp is not None:
+                    chart_info = self._parse_dtpp_info(chart_resp.text)
+                    if chart_info.get("urls"):
+                        if not chart_info.get("edition_date"):
+                            chart_info["edition_date"] = info.get("edition_date", "")
+                        return chart_info
+                sample = " ".join(resp.text.split())[:220]
+                self._log(f"TPP info parse had no URLs for params={params}; sample={sample}")
+            except requests.RequestException as exc:
+                last_error = exc
+                status = getattr(exc, "response", None).status_code if getattr(exc, "response", None) else None
+                if status == 404:
+                    self._log(f"TPP info 404 for params: {params}")
+                    continue
+                raise
+        if last_error:
+            raise RuntimeError("APRA dtpp/info returned 404. Check APRA access.") from last_error
+        raise RuntimeError("Failed to retrieve TPP info from APRA.")
+
+    def _parse_dtpp_info(self, text: str) -> Dict[str, object]:
+        urls: List[str] = []
+        edition_date = ""
+        try:
+            data = json.loads(text)
+            if isinstance(data, dict):
+                editions = data.get("edition") or data.get("editions") or []
+                if isinstance(editions, dict):
+                    editions = [editions]
+                for ed in editions:
+                    if isinstance(ed, dict):
+                        ed_date = str(ed.get("editionDate") or ed.get("edition_date") or "")
+                        if ed_date and not edition_date:
+                            edition_date = ed_date
+                        prod = ed.get("product") or {}
+                        if isinstance(prod, dict):
+                            url = str(prod.get("url") or "")
+                            if url:
+                                urls.append(url)
+        except Exception:
+            pass
+
+        # XML fallback for APRA's default productSet payload.
+        if (not urls) or (not edition_date):
+            try:
+                root = ET.fromstring(text)
+                for elem in root.iter():
+                    tag = self._strip_xml_ns(elem.tag)
+                    if tag == "editionDate" and not edition_date:
+                        edition_date = (elem.text or "").strip()
+                    if tag == "product":
+                        url = (elem.attrib.get("url") or "").strip()
+                        if url:
+                            urls.append(url)
+            except Exception:
+                pass
+        if not urls:
+            urls = re.findall(r'url="([^"]+)"', text)
+        if not edition_date:
+            match = re.search(r"<editionDate>([^<]+)</editionDate>", text)
+            if match:
+                edition_date = match.group(1).strip()
+        return {"edition_date": edition_date, "urls": urls}
+
+    def _load_tpp_index(self) -> Optional[Dict[str, object]]:
+        if not TPP_INDEX_FILE.exists():
+            return None
+        try:
+            return json.loads(TPP_INDEX_FILE.read_text(encoding="utf-8"))
+        except Exception:
+            return None
+
+    def _save_tpp_index(self, data: Dict[str, object]) -> None:
+        DATA_DIR.mkdir(parents=True, exist_ok=True)
+        TPP_INDEX_FILE.write_text(json.dumps(data, indent=2), encoding="utf-8")
+        self._refresh_status()
+
+    def _build_tpp_index(self, info: Dict[str, object]) -> Dict[str, object]:
+        urls = [u for u in info.get("urls", []) if isinstance(u, str)]
+        if not urls:
+            raise RuntimeError("TPP info response contained no URLs.")
+        # Prefer the E zip which contains the metafile XML.
+        e_urls = [u for u in urls if "DDTPPE" in u.upper()]
+        use_urls = e_urls or urls
+        TPP_DIR.mkdir(parents=True, exist_ok=True)
+        charts: List[Dict[str, str]] = []
+        for url in use_urls:
+            zip_path = TPP_DIR / Path(url).name
+            if not zip_path.exists():
+                self._log(f"Downloading TPP bundle: {zip_path.name} (may be large)...")
+                self._http_download(url, zip_path)
+            self._log(f"Parsing metafile from {zip_path.name}...")
+            charts.extend(self._parse_tpp_zip(zip_path))
+        return {
+            "edition_date": info.get("edition_date", ""),
+            "generated": datetime.utcnow().isoformat() + "Z",
+            "bundle_urls": urls,
+            "charts": charts,
+        }
+
+    def _parse_tpp_zip(self, zip_path: Path) -> List[Dict[str, str]]:
+        with zipfile.ZipFile(zip_path, "r") as zf:
+            xml_name = None
+            for name in zf.namelist():
+                if name.lower().endswith("d-tpp_metafile.xml"):
+                    xml_name = name
+                    break
+            if not xml_name:
+                raise RuntimeError("d-TPP_Metafile.xml not found in TPP zip.")
+            with zf.open(xml_name) as f:
+                return self._parse_tpp_metafile(f)
+
+    def _parse_tpp_metafile(self, fileobj: io.BufferedReader) -> List[Dict[str, str]]:
+        charts: List[Dict[str, str]] = []
+        current_volume = ""
+        current_apt = ""
+        current_icao = ""
+        cycle = ""
+        for event, elem in ET.iterparse(fileobj, events=("start", "end")):
+            tag = self._strip_xml_ns(elem.tag)
+            if event == "start":
+                if tag == "digital_tpp":
+                    cycle = elem.attrib.get("cycle", "").strip()
+                elif tag == "city_name":
+                    current_volume = elem.attrib.get("volume", "").strip()
+                elif tag == "airport_name":
+                    current_apt = elem.attrib.get("apt_ident", "").strip()
+                    current_icao = elem.attrib.get("icao_ident", "").strip()
+            elif event == "end":
+                if tag == "record":
+                    chart_name = self._find_xml_child_text(elem, "chart_name")
+                    chart_code = self._find_xml_child_text(elem, "chart_code")
+                    pdf_name = self._find_xml_child_text(elem, "pdf_name")
+                    if not pdf_name or pdf_name.upper() in ("DELETED_JOB.PDF", "DEL_APT_SERVED.PDF"):
+                        elem.clear()
+                        continue
+                    if not chart_name:
+                        chart_name = pdf_name
+                    if current_volume and cycle:
+                        url = f"https://aeronav.faa.gov/d-tpp/{cycle}/{current_volume}/{pdf_name}"
+                    else:
+                        url = ""
+                    label = chart_name
+                    if chart_code:
+                        label = f"{chart_code} - {chart_name}"
+                    charts.append(
+                        {
+                            "airport_id": current_apt,
+                            "icao_id": current_icao,
+                            "chart_name": label.strip(),
+                            "pdf_name": pdf_name,
+                            "volume": current_volume,
+                            "cycle": cycle,
+                            "url": url,
+                        }
+                    )
+                    elem.clear()
+                elif tag == "airport_name":
+                    current_apt = ""
+                    current_icao = ""
+                elif tag == "city_name":
+                    current_volume = ""
+        return charts
+
+    def _strip_xml_ns(self, tag: str) -> str:
+        if "}" in tag:
+            return tag.split("}", 1)[1]
+        return tag
+
+    def _find_xml_child_text(self, elem: ET.Element, name: str) -> str:
+        for child in list(elem):
+            if self._strip_xml_ns(child.tag) == name:
+                return (child.text or "").strip()
+        return ""
+
     def on_load_selected_tpp(self) -> None:
         if not self.tpp_list.curselection():
             messagebox.showwarning("Missing selection", "Select an approach first.")
             return
         idx = self.tpp_list.curselection()[0]
         chart = self.tpp_charts[idx]
+        self.current_chart_name = chart.chart_name
         threading.Thread(target=self._download_and_load_tpp, args=(chart,), daemon=True).start()
 
     def _download_and_load_tpp(self, chart: TppChart) -> None:
@@ -951,12 +1328,67 @@ class App(tk.Tk):
             dest = CACHE_DIR / Path(chart.url).name
             if not dest.exists():
                 self._log(f"Downloading {chart.chart_name}...")
-                self._http_download(chart.url, dest)
+                try:
+                    self._http_download(chart.url, dest)
+                except requests.HTTPError as exc:
+                    status = exc.response.status_code if exc.response is not None else None
+                    if status == 404:
+                        if self._extract_tpp_pdf_from_local_zip(dest.name, dest):
+                            self._log("FAA URL returned 404. Loaded PDF from local TPP zip cache.")
+                        else:
+                            self._ensure_all_tpp_bundles_cached()
+                            if self._extract_tpp_pdf_from_local_zip(dest.name, dest):
+                                self._log("FAA URL returned 404. Loaded PDF from downloaded TPP bundle cache.")
+                            else:
+                                raise
+                    else:
+                        raise
             self.pdf_path = dest
             self._render_pdf()
         except Exception as exc:
             self._log(f"Error: {exc}")
             messagebox.showerror("Download Failed", str(exc))
+
+    def _extract_tpp_pdf_from_local_zip(self, pdf_name: str, dest: Path) -> bool:
+        if not TPP_DIR.exists():
+            return False
+        target = pdf_name.lower()
+        for zip_path in sorted(TPP_DIR.glob("DDTPP*.zip")):
+            try:
+                with zipfile.ZipFile(zip_path, "r") as zf:
+                    for member in zf.namelist():
+                        if Path(member).name.lower() != target:
+                            continue
+                        with zf.open(member) as src, open(dest, "wb") as out:
+                            shutil.copyfileobj(src, out)
+                        return True
+            except Exception:
+                continue
+        return False
+
+    def _ensure_all_tpp_bundles_cached(self) -> None:
+        index = self._load_tpp_index()
+        urls: List[str] = []
+        if index:
+            urls = [u for u in index.get("bundle_urls", []) if isinstance(u, str)]
+        if not urls:
+            info = self._fetch_dtpp_info()
+            urls = [u for u in info.get("urls", []) if isinstance(u, str)]
+            if index:
+                index["bundle_urls"] = urls
+                self._save_tpp_index(index)
+        if not urls:
+            return
+        TPP_DIR.mkdir(parents=True, exist_ok=True)
+        for url in urls:
+            name = Path(url).name
+            if not name.upper().startswith("DDTPP") or not name.lower().endswith(".zip"):
+                continue
+            dest = TPP_DIR / name
+            if dest.exists():
+                continue
+            self._log(f"Caching missing TPP bundle: {name}...")
+            self._http_download(url, dest)
 
     def _find_nearby_fixes(self, lat: float, lon: float, radius_nm: float) -> List[FixPoint]:
         out: List[FixPoint] = []
@@ -971,6 +1403,7 @@ class App(tk.Tk):
         if not path:
             return
         self.pdf_path = Path(path)
+        self.current_chart_name = self.pdf_path.stem
         self._render_pdf()
 
     def _render_pdf(self) -> None:
@@ -1018,7 +1451,7 @@ class App(tk.Tk):
         canvas_w = self.canvas.winfo_width() or 800
         canvas_h = self.canvas.winfo_height() or 600
         scale = min(canvas_w / self.page_image.width, canvas_h / self.page_image.height)
-        self.display_scale = max(0.1, min(scale * self.zoom, 8.0))
+        self.display_scale = max(0.02, min(scale * self.zoom, 24.0))
         display = self.page_image.resize(
             (
                 int(self.page_image.width * self.display_scale),
@@ -1032,9 +1465,12 @@ class App(tk.Tk):
         self._draw_clicks()
 
     def _draw_crop_box(self) -> None:
-        if not self.crop_box:
+        if not self.crop_box or not self.page_image:
             return
-        x1, y1, x2, y2 = self.crop_box
+        norm = self._normalized_crop_box(self.crop_box, self.page_image.width, self.page_image.height)
+        if not norm:
+            return
+        x1, y1, x2, y2 = norm
         x1 = x1 * self.display_scale + self.pan_x
         y1 = y1 * self.display_scale + self.pan_y
         x2 = x2 * self.display_scale + self.pan_x
@@ -1052,11 +1488,13 @@ class App(tk.Tk):
             y = y * self.display_scale + self.pan_y
             color = "#ffcc00" if idx == 0 else "#00ccff"
             self.canvas.create_oval(x - 4, y - 4, x + 4, y + 4, fill=color, outline="black")
-        if self.refine_point:
-            x, y = self.refine_point
+        for idx, (pt, _) in enumerate(self.refine_points):
+            x, y = pt
             x = x * self.display_scale + self.pan_x
             y = y * self.display_scale + self.pan_y
-            self.canvas.create_oval(x - 4, y - 4, x + 4, y + 4, fill="#ff66cc", outline="black")
+            label = str(idx + 1)
+            self.canvas.create_oval(x - 5, y - 5, x + 5, y + 5, fill="#ff66cc", outline="black")
+            self.canvas.create_text(x + 9, y - 9, text=label, fill="#ff66cc", anchor="nw")
 
     def on_canvas_click(self, event: tk.Event) -> None:
         if not self.page_image:
@@ -1101,11 +1539,11 @@ class App(tk.Tk):
         self._pan_anchor = None
 
     def on_zoom_in(self) -> None:
-        self.zoom = min(self.zoom * 1.25, 6.0)
+        self.zoom = min(self.zoom * 1.25, 20.0)
         self._draw_image()
 
     def on_zoom_out(self) -> None:
-        self.zoom = max(self.zoom / 1.25, 0.2)
+        self.zoom = max(self.zoom / 1.25, 0.05)
         self._draw_image()
 
     def on_zoom_fit(self) -> None:
@@ -1119,6 +1557,25 @@ class App(tk.Tk):
             self.on_zoom_in()
         else:
             self.on_zoom_out()
+
+    def on_canvas_motion(self, event: tk.Event) -> None:
+        if not self.show_target_var.get() or self._pending_refine_fix is None:
+            self._hide_target_cursor()
+            return
+        radius = max(2, int(self.target_radius_var.get()))
+        x1, y1 = event.x - radius, event.y - radius
+        x2, y2 = event.x + radius, event.y + radius
+        if self._target_circle_id is None:
+            self._target_circle_id = self.canvas.create_oval(
+                x1, y1, x2, y2, outline="#ff66cc", width=2, dash=(2, 2)
+            )
+        else:
+            self.canvas.coords(self._target_circle_id, x1, y1, x2, y2)
+
+    def _hide_target_cursor(self) -> None:
+        if self._target_circle_id is not None:
+            self.canvas.delete(self._target_circle_id)
+            self._target_circle_id = None
 
     def _screen_to_image(self, x: float, y: float) -> Tuple[float, float]:
         return ((x - self.pan_x) / self.display_scale, (y - self.pan_y) / self.display_scale)
@@ -1139,7 +1596,8 @@ class App(tk.Tk):
 
     def _reset_clicks(self) -> None:
         self.click_points = []
-        self.refine_point = None
+        self.refine_points = []
+        self._pending_refine_fix = None
         if self.selected_runway:
             self.instruction_var.set(
                 f"Click runway end {self.selected_runway.end1.ident} on the chart."
@@ -1154,17 +1612,33 @@ class App(tk.Tk):
         if len(self.click_points) < 2:
             messagebox.showwarning("Missing clicks", "Click both runway ends first.")
             return
-        if self.fix_var.get() == "None":
+        fix = self._selected_fix()
+        if fix is None:
             messagebox.showwarning("Missing fix", "Select a fix/VOR to refine.")
             return
-        messagebox.showinfo("Refine", "Click the selected fix on the chart.")
-        self.refine_point = None
-        self.canvas.bind("<Button-1>", self._capture_refine_click, add="+")
+        self._pending_refine_fix = fix
+        messagebox.showinfo("Refine", f"Click {fix.ident} on the chart.")
+        self._hide_target_cursor()
+        if self._refine_bind_id:
+            self.canvas.unbind("<Button-1>", self._refine_bind_id)
+            self._refine_bind_id = None
+        self._refine_bind_id = self.canvas.bind("<Button-1>", self._capture_refine_click, add="+")
 
     def _capture_refine_click(self, event: tk.Event) -> None:
-        self.refine_point = self._screen_to_image(event.x, event.y)
-        self.canvas.unbind("<Button-1>", self._capture_refine_click)
-        self._draw_image()
+        try:
+            if self._pending_refine_fix is None:
+                return
+            self.refine_points.append((self._screen_to_image(event.x, event.y), self._pending_refine_fix))
+            self.instruction_var.set(
+                f"Refine points: {len(self.refine_points)}. Add more fixes or Generate KMZ."
+            )
+            self._draw_image()
+        finally:
+            self._pending_refine_fix = None
+            self._hide_target_cursor()
+            if self._refine_bind_id:
+                self.canvas.unbind("<Button-1>", self._refine_bind_id)
+                self._refine_bind_id = None
 
     def on_generate(self) -> None:
         if not self.selected_airport or not self.selected_runway:
@@ -1185,12 +1659,19 @@ class App(tk.Tk):
             self._log(f"Saved KMZ: {kmz_path}")
             if err_m is not None:
                 self._log(f"Estimated error: {err_m:.1f} m")
+            try:
+                os.startfile(str(output_dir))  # type: ignore[attr-defined]
+            except Exception:
+                pass
         except Exception as exc:
             self._log(f"Error: {exc}")
             messagebox.showerror("Generate Failed", str(exc))
 
     def _generate_kmz(self, output_dir: Path) -> Tuple[Path, Optional[float]]:
-        crop_img = self.page_image.crop(self.crop_box)
+        norm_crop = self._normalized_crop_box(self.crop_box, self.page_image.width, self.page_image.height)
+        if not norm_crop:
+            raise RuntimeError("Invalid crop area. Drag a valid crop box on the chart.")
+        crop_img = self.page_image.crop(norm_crop)
         width, height = crop_img.size
 
         p1 = self._to_crop_coords(self.click_points[0])
@@ -1203,26 +1684,39 @@ class App(tk.Tk):
         q1 = enu.geodetic_to_enu(end_a.lat, end_a.lon)
         q2 = enu.geodetic_to_enu(end_b.lat, end_b.lon)
 
-        transform = SimilarityTransform.from_two_points(p1, p2, q1, q2)
+        points_px = [p1, p2]
+        points_enu = [q1, q2]
+        for px_pt, fix in self.refine_points:
+            points_px.append(self._to_crop_coords(px_pt))
+            points_enu.append(enu.geodetic_to_enu(fix.lat, fix.lon))
 
+        transform = SimilarityTransform.from_two_points(p1, p2, q1, q2)
         err_m = None
-        if self.refine_point and self.fix_var.get() != "None":
-            fix = self._selected_fix()
-            if fix:
-                p3 = self._to_crop_coords(self.refine_point)
-                q3 = enu.geodetic_to_enu(fix.lat, fix.lon)
-                transform, err_m = SimilarityTransform.refine([p1, p2, p3], [q1, q2, q3])
+        if len(points_px) >= 3:
+            # Keep runway axis dominant; refine points improve local fit without introducing
+            # noticeable rotational drift from small waypoint click errors.
+            weights = [8.0, 8.0] + [1.0] * (len(points_px) - 2)
+            transform, err_m = SimilarityTransform.refine(points_px, points_enu, weights=weights)
 
         if rwy.length_ft:
             implied_len = transform.distance(p1, p2)
             expected_m = rwy.length_ft * 0.3048
-            if abs(implied_len - expected_m) / expected_m > 0.05:
-                raise RuntimeError("Clicks don't match runway length; re-click thresholds.")
+            rel_err = abs(implied_len - expected_m) / expected_m
+            hard_limit = 0.35 if len(self.refine_points) >= 1 else 0.20
+            if rel_err > hard_limit:
+                raise RuntimeError("Runway length mismatch is too large. Re-click runway thresholds.")
+            if rel_err > 0.10:
+                self._log(
+                    f"Warning: runway length mismatch {rel_err * 100:.1f}% "
+                    "(continuing because tolerance is relaxed)."
+                )
 
         corners_px = [(0, 0), (width, 0), (width, height), (0, height)]
         corners_ll = [enu.enu_to_geodetic(*transform.apply(p)) for p in corners_px]
 
-        name = f"{self.selected_airport.ident}_{self.selected_runway.ident}.kmz"
+        airport_name = self._sanitize_filename_part(self.selected_airport.ident)
+        proc_name = self._sanitize_filename_part(self._display_procedure_name(self._current_procedure_name()))
+        name = f"{airport_name} {proc_name}.kmz"
         out_path = output_dir / name
 
         with tempfile.TemporaryDirectory() as tmp:
@@ -1235,7 +1729,15 @@ class App(tk.Tk):
         return kmz_path, err_m
 
     def _build_kml(self, corners_ll: List[Tuple[float, float]]) -> str:
-        coords = " ".join([f"{lon},{lat},0" for lat, lon in corners_ll])
+        # Google Earth expects gx:LatLonQuad corners in this order:
+        # lower-left, lower-right, upper-right, upper-left.
+        if len(corners_ll) == 4:
+            ordered = [corners_ll[3], corners_ll[2], corners_ll[1], corners_ll[0]]
+        else:
+            ordered = corners_ll
+        coords = " ".join([f"{lon},{lat},0" for lat, lon in ordered])
+        point_lat = self.selected_airport.lat
+        point_lon = self.selected_airport.lon
         meta = (
             f"Airport: {self.selected_airport.ident}\\n"
             f"Runway: {self.selected_runway.ident}\\n"
@@ -1248,10 +1750,15 @@ class App(tk.Tk):
     <Placemark>
       <name>Georef Metadata</name>
       <description>{meta}</description>
-      <Point><coordinates>0,0,0</coordinates></Point>
+      <Point>
+        <altitudeMode>clampToGround</altitudeMode>
+        <coordinates>{point_lon},{point_lat},0</coordinates>
+      </Point>
     </Placemark>
     <GroundOverlay>
       <name>Overlay</name>
+      <altitude>0</altitude>
+      <altitudeMode>clampToGround</altitudeMode>
       <Icon>
         <href>overlay.png</href>
       </Icon>
@@ -1270,16 +1777,40 @@ class App(tk.Tk):
 
     def _to_crop_coords(self, pt: Tuple[float, float]) -> Tuple[float, float]:
         x, y = pt
-        cx1, cy1, _, _ = self.crop_box
+        if not self.page_image:
+            return (x, y)
+        norm = self._normalized_crop_box(self.crop_box, self.page_image.width, self.page_image.height)
+        if not norm:
+            return (x, y)
+        cx1, cy1, _, _ = norm
         return (x - cx1, y - cy1)
+
+    def _normalized_crop_box(
+        self, crop_box: Optional[Tuple[int, int, int, int]], width: int, height: int
+    ) -> Optional[Tuple[int, int, int, int]]:
+        if not crop_box:
+            return None
+        x1, y1, x2, y2 = crop_box
+        x1 = max(0, min(width, int(x1)))
+        x2 = max(0, min(width, int(x2)))
+        y1 = max(0, min(height, int(y1)))
+        y2 = max(0, min(height, int(y2)))
+        if x2 <= x1 or y2 <= y1:
+            return None
+        return (x1, y1, x2, y2)
 
     def _selected_fix(self) -> Optional[FixPoint]:
         label = self.fix_var.get()
-        if label == "None":
+        if not label or label.strip().lower() == "none":
             return None
-        ident = label.split(" ")[0]
+        ident = label.split(" ")[0].strip().upper()
+        if not ident:
+            return None
         for f in self.nearby_fixes:
-            if f.ident == ident:
+            if f.ident.upper() == ident:
+                return f
+        for f in self.nearby_fixes:
+            if f.ident.upper().startswith(ident):
                 return f
         return None
 
@@ -1292,6 +1823,258 @@ class App(tk.Tk):
         a = math.sin(dphi / 2) ** 2 + math.cos(phi1) * math.cos(phi2) * math.sin(dl / 2) ** 2
         c = 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a))
         return (r * c) / 1852.0
+
+    def _sanitize_filename_part(self, value: str) -> str:
+        cleaned = re.sub(r'[<>:"/\\\\|?*]+', " ", value.strip())
+        cleaned = re.sub(r"\s+", " ", cleaned).strip(" .")
+        return cleaned or "unnamed"
+
+    def _display_procedure_name(self, name: str) -> str:
+        # Keep user-facing chart naming while removing APRA category prefixes.
+        return re.sub(r"^(IAP|ODP|DP|STAR)\s*-\s*", "", name.strip(), flags=re.IGNORECASE)
+
+    def _refresh_status(self) -> None:
+        if not hasattr(self, "status_var"):
+            return
+        nasr = self._status_nasr_cycle()
+        tpp = self._status_tpp_cycle()
+        apra = "configured" if self._apra_headers() is not None else "not configured"
+        self.status_var.set(f"NASR: {nasr} | TPP: {tpp} | APRA: {apra}")
+
+    def _status_nasr_cycle(self) -> str:
+        if self.nasr_date_var.get().strip():
+            return self.nasr_date_var.get().strip()
+        if not NASR_DIR.exists():
+            return "none"
+        dates: List[str] = []
+        for p in NASR_DIR.glob("NASR_*.pkl"):
+            m = re.search(r"NASR_(\d{4}-\d{2}-\d{2})\.pkl$", p.name)
+            if m:
+                dates.append(m.group(1))
+        return max(dates) if dates else "none"
+
+    def _status_tpp_cycle(self) -> str:
+        if not TPP_INDEX_FILE.exists():
+            return "none"
+        try:
+            data = json.loads(TPP_INDEX_FILE.read_text(encoding="utf-8"))
+            return str(data.get("edition_date") or "cached")
+        except Exception:
+            return "cached"
+
+    def _current_procedure_name(self) -> str:
+        if self.current_chart_name:
+            return self.current_chart_name
+        if self.tpp_list.curselection():
+            idx = self.tpp_list.curselection()[0]
+            if 0 <= idx < len(self.tpp_charts):
+                return self.tpp_charts[idx].chart_name
+        if self.selected_runway:
+            return self.selected_runway.ident
+        return "procedure"
+
+    def _geo_product_changed(self) -> None:
+        product = self.geo_product_var.get()
+        if product == "IFR Enroute":
+            self.geo_geoname_combo["values"] = ["US", "Alaska", "Pacific", "Caribbean"]
+            self.geo_geoname_var.set("US")
+            self.geo_series_combo.configure(state="readonly")
+            self.geo_series_var.set("low")
+        elif product == "IFR Planning":
+            self.geo_geoname_combo["values"] = ["US", "NA", "PO", "WAT"]
+            self.geo_geoname_var.set("US")
+            self.geo_series_combo.configure(state="disabled")
+            self.geo_series_var.set("low")
+        elif product == "VFR Sectional":
+            self.geo_geoname_combo["values"] = [
+                "Denver", "Seattle", "Los Angeles", "Dallas-Ft Worth", "Phoenix", "Chicago", "New York"
+            ]
+            self.geo_geoname_var.set("Denver")
+            self.geo_series_combo.configure(state="disabled")
+            self.geo_series_var.set("low")
+        else:  # VFR TAC
+            self.geo_geoname_combo["values"] = [
+                "Denver-Colorado Springs", "Los Angeles", "Seattle", "Dallas-Ft Worth", "New York", "Chicago"
+            ]
+            self.geo_geoname_var.set("Denver-Colorado Springs")
+            self.geo_series_combo.configure(state="disabled")
+            self.geo_series_var.set("low")
+
+    def on_geo_fetch(self) -> None:
+        threading.Thread(target=self._geo_fetch_worker, daemon=True).start()
+
+    def _geo_fetch_worker(self) -> None:
+        try:
+            resp = self._apra_get_geotiff_release()
+            if resp is None:
+                raise RuntimeError("APRA credentials not configured.")
+            items = self._parse_geo_release(resp.text)
+            self.geo_results = items
+            self.geo_list.delete(0, "end")
+            for item in items:
+                self.geo_list.insert("end", item.get("label", ""))
+            self._log(f"Loaded {len(items)} GeoTIFF link(s).")
+        except Exception as exc:
+            self._log(f"Error: {exc}")
+            messagebox.showerror("GeoTIFF Fetch Failed", str(exc))
+
+    def _apra_get_geotiff_release(self) -> Optional[requests.Response]:
+        product = self.geo_product_var.get()
+        edition = self.geo_edition_var.get().strip() or "current"
+        geoname = self.geo_geoname_var.get().strip()
+        if product == "IFR Enroute":
+            params = {"edition": edition, "format": "tiff", "geoname": geoname, "seriesType": self.geo_series_var.get()}
+            return self._apra_get("/enroute/chart", params=params)
+        if product == "IFR Planning":
+            params = {"edition": edition, "format": "tiff", "geoname": geoname}
+            return self._apra_get("/ifr/planning/chart", params=params)
+        if product == "VFR Sectional":
+            params = {"edition": edition, "format": "tiff", "geoname": geoname}
+            return self._apra_get("/vfr/sectional/chart", params=params)
+        params = {"edition": edition, "format": "tiff", "geoname": geoname}
+        return self._apra_get("/vfr/tac/chart", params=params)
+
+    def _parse_geo_release(self, text: str) -> List[Dict[str, str]]:
+        out: List[Dict[str, str]] = []
+        # XML APRA format: product url attr.
+        try:
+            root = ET.fromstring(text)
+            idx = 1
+            for elem in root.iter():
+                if self._strip_xml_ns(elem.tag) != "product":
+                    continue
+                url = (elem.attrib.get("url") or "").strip()
+                if not url:
+                    continue
+                name = (
+                    elem.attrib.get("chartName")
+                    or elem.attrib.get("productName")
+                    or Path(url).name
+                )
+                out.append({"url": url, "label": f"{idx}. {name}", "name": str(name)})
+                idx += 1
+        except Exception:
+            pass
+        if out:
+            return out
+        # Fallback regex parse.
+        urls = re.findall(r'url="([^"]+)"', text)
+        for idx, url in enumerate(urls, start=1):
+            out.append({"url": url, "label": f"{idx}. {Path(url).name}", "name": Path(url).name})
+        return out
+
+    def on_geo_download_selected(self) -> None:
+        threading.Thread(target=self._geo_download_worker, args=(False,), daemon=True).start()
+
+    def on_geo_download_export_kmz(self) -> None:
+        threading.Thread(target=self._geo_download_worker, args=(True,), daemon=True).start()
+
+    def _geo_download_worker(self, export_kmz: bool) -> None:
+        try:
+            if not self.geo_list.curselection():
+                raise RuntimeError("Select a GeoTIFF item first.")
+            idx = self.geo_list.curselection()[0]
+            item = self.geo_results[idx]
+            url = item.get("url", "")
+            if not url:
+                raise RuntimeError("Selected item has no URL.")
+            CHARTS_DIR.mkdir(parents=True, exist_ok=True)
+            dest = CHARTS_DIR / Path(url).name
+            if not dest.exists():
+                self._log(f"Downloading {dest.name}...")
+                self._http_download(url, dest)
+            self._log(f"Saved: {dest}")
+            if export_kmz:
+                kmz = self._export_geotiff_to_kmz(dest)
+                self._log(f"Exported KMZ: {kmz}")
+                try:
+                    os.startfile(str(kmz.parent))  # type: ignore[attr-defined]
+                except Exception:
+                    pass
+        except Exception as exc:
+            self._log(f"Error: {exc}")
+            messagebox.showerror("GeoTIFF Download Failed", str(exc))
+
+    def _export_geotiff_to_kmz(self, source: Path) -> Path:
+        tif = source
+        if tif.suffix.lower() == ".zip":
+            tif = self._extract_first_tif_from_zip(tif)
+        if tif.suffix.lower() not in (".tif", ".tiff"):
+            raise RuntimeError("Downloaded file is not a GeoTIFF.")
+        out = tif.with_suffix(".kmz")
+        gdal = self._find_gdal_translate()
+        if not gdal:
+            gdal = self._prompt_for_gdal_translate()
+        if not gdal:
+            raise RuntimeError("gdal_translate not found. Install GDAL or select gdal_translate.exe.")
+        cmd = [gdal, "-of", "KMLSUPEROVERLAY", str(tif), str(out)]
+        proc = subprocess.run(cmd, capture_output=True, text=True)
+        if proc.returncode != 0:
+            stderr = (proc.stderr or "").strip()
+            raise RuntimeError(f"GDAL export failed: {stderr[:300]}")
+        return out
+
+    def _find_gdal_translate(self) -> Optional[str]:
+        # 1) explicit env override
+        env_path = os.environ.get("GDAL_TRANSLATE", "").strip()
+        if env_path and Path(env_path).exists():
+            return env_path
+
+        # 2) regular PATH lookup
+        path_hit = shutil.which("gdal_translate")
+        if path_hit:
+            return path_hit
+        path_hit_exe = shutil.which("gdal_translate.exe")
+        if path_hit_exe:
+            return path_hit_exe
+
+        # 3) common Windows install locations
+        candidates = [
+            Path(r"C:\Program Files\GDAL\gdal_translate.exe"),
+            Path(r"C:\Program Files\GDAL\bin\gdal_translate.exe"),
+            Path(r"C:\OSGeo4W\bin\gdal_translate.exe"),
+            Path(r"C:\OSGeo4W64\bin\gdal_translate.exe"),
+        ]
+        for p in candidates:
+            if p.exists():
+                return str(p)
+
+        root = Path(r"C:\Program Files\GDAL")
+        if root.exists():
+            hits = list(root.rglob("gdal_translate.exe"))
+            if hits:
+                return str(hits[0])
+        return None
+
+    def _prompt_for_gdal_translate(self) -> Optional[str]:
+        msg = (
+            "Could not auto-find gdal_translate.exe.\n\n"
+            "Select gdal_translate.exe to continue GeoTIFF -> KMZ export."
+        )
+        if not messagebox.askyesno("Locate GDAL", msg):
+            return None
+        path = filedialog.askopenfilename(
+            title="Select gdal_translate.exe",
+            filetypes=[("GDAL Translate", "gdal_translate.exe"), ("Executable", "*.exe")],
+        )
+        if not path:
+            return None
+        if Path(path).name.lower() != "gdal_translate.exe":
+            messagebox.showwarning("Invalid File", "Please select gdal_translate.exe.")
+            return None
+        os.environ["GDAL_TRANSLATE"] = path
+        return path
+
+    def _extract_first_tif_from_zip(self, zip_path: Path) -> Path:
+        with zipfile.ZipFile(zip_path, "r") as zf:
+            for name in zf.namelist():
+                if name.lower().endswith((".tif", ".tiff")):
+                    out = CHARTS_DIR / Path(name).name
+                    if not out.exists():
+                        with zf.open(name) as src, open(out, "wb") as dst:
+                            shutil.copyfileobj(src, dst)
+                    return out
+        raise RuntimeError("No GeoTIFF found in ZIP.")
 
     def _http_download(self, url: str, dest: Path, referer: Optional[str] = None) -> None:
         headers = {"User-Agent": "Mozilla/5.0", "Accept": "*/*"}
@@ -1362,24 +2145,42 @@ class SimilarityTransform:
         return SimilarityTransform(scale, rotation, q1, p1)
 
     @staticmethod
-    def refine(points_px: List[Tuple[float, float]], points_enu: List[Tuple[float, float]]):
+    def refine(
+        points_px: List[Tuple[float, float]],
+        points_enu: List[Tuple[float, float]],
+        weights: Optional[List[float]] = None,
+    ):
         P = np.array([[p[0], -p[1]] for p in points_px], dtype=float)
         Q = np.array(points_enu, dtype=float)
-        Pc = P.mean(axis=0)
-        Qc = Q.mean(axis=0)
+        if weights is None:
+            w = np.ones(len(points_px), dtype=float)
+        else:
+            w = np.array(weights, dtype=float)
+            if w.shape[0] != len(points_px):
+                raise RuntimeError("Refine weights length mismatch.")
+            w = np.clip(w, 1e-6, None)
+        w_sum = np.sum(w)
+        if w_sum <= 0:
+            raise RuntimeError("Invalid refine weights.")
+        wn = w / w_sum
+        Pc = np.sum(P * wn[:, None], axis=0)
+        Qc = np.sum(Q * wn[:, None], axis=0)
         P0 = P - Pc
         Q0 = Q - Qc
-        H = P0.T @ Q0
+        H = P0.T @ (Q0 * wn[:, None])
         U, S, Vt = np.linalg.svd(H)
         R = Vt.T @ U.T
         if np.linalg.det(R) < 0:
             Vt[1, :] *= -1
             R = Vt.T @ U.T
-        scale = np.trace(R.T @ H) / np.trace(P0.T @ P0)
+        denom = np.sum(wn * np.sum(P0 * P0, axis=1))
+        if denom <= 0:
+            raise RuntimeError("Degenerate refine geometry.")
+        scale = np.trace(R.T @ H) / denom
         t = Qc - scale * (R @ Pc)
 
         Qp = (scale * (R @ P.T)).T + t
-        err = np.sqrt(np.mean(np.sum((Qp - Q) ** 2, axis=1)))
+        err = np.sqrt(np.sum(wn * np.sum((Qp - Q) ** 2, axis=1)))
 
         def apply_fn(p: Tuple[float, float]) -> Tuple[float, float]:
             v = np.array([p[0], -p[1]])

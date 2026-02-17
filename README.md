@@ -1,47 +1,80 @@
-﻿# FAA Plate Georef (Runway-Click)
+# FAA Plate Georef (Runway-Click)
 
-This app georeferences approach plates and airport diagrams with a simple two-click workflow using runway endpoints from FAA NASR data.
+Windows Python app to download FAA approach plates, georeference them with runway/fix clicks, and export KMZ overlays for Google Earth.
 
-## Installer steps (baby steps)
+## Install (baby steps)
 
-1. **Create the Python sandbox (one-time)**
-   - Run `python -m venv .venv`
-   - Activate it with `.\.venv\Scripts\Activate.ps1`
-2. **Install the Python pieces**
-   - Inside the activated shell, run `pip install -r requirements.txt`
-3. **Launch the app**
-   - Run `python src\app.py`
+1. Open PowerShell in the project folder.
+2. Create virtual environment:
+   - `python -m venv .venv`
+3. Activate it:
+   - `.\.venv\Scripts\Activate.ps1`
+4. Install packages:
+   - `python -m pip install -r requirements.txt`
+5. Start app:
+   - `python src\app.py`
 
-## Workflow (two-click georef)
+## What it does now
 
-1. Click **Update NASR** (downloads runway endpoints + fixes).
-2. Click **Load PDF** and select your chart.
-3. Search for the airport and select the runway.
-4. Click **Runway end A** and **Runway end B** on the chart.
-5. (Optional) Pick a nearby fix/VOR and click **Refine** for a 3-point fit.
-6. Click **Generate KMZ** and open it in Google Earth.
+- Starts maximized/full screen.
+- Loads airport/runway/fix data from FAA NASR.
+- Fetches approach list from APRA/TPP metadata.
+- Downloads selected approach PDF (with local TPP ZIP fallback if FAA URL is 404).
+- Lets you:
+  - click runway threshold A and B
+  - optionally add multiple fix/VOR refine clicks
+  - export KMZ (`gx:LatLonQuad`) for Google Earth.
+- Opens output folder automatically after KMZ export.
 
-## Notes
+## Main workflow
 
-- Default rendering is **400 DPI** for stable geometry.
-- If runway length error > 5%, the app asks you to re-click.
-- Output is a KMZ GroundOverlay using `gx:LatLonQuad` for rotation support.
+1. Click `Update NASR`.
+2. Search/select airport and runway.
+3. Click `Fetch Approaches`.
+4. Select approach and click `Load Selected PDF`.
+5. Click runway end A then runway end B on chart.
+6. Optional refine:
+   - select fix (you can type to search)
+   - click `Refine`
+   - click that fix on the chart
+   - repeat for more fixes if needed.
+7. Click `Generate KMZ`.
 
-## APRA API (optional)
+## Output naming
 
-If you have FAA APRA access, set these environment variables to let the app
-pull NASR data through the API instead of the public download page:
+KMZ file name format:
+- `<AIRPORT_ID> <PROCEDURE_NAME>.kmz`
 
-- `APRA_BASE_URL` (default `https://external-api.faa.gov/apra`)
-- `APRA_API_KEY` and `APRA_API_KEY_HEADER` (if API key auth)
-- or `APRA_TOKEN_URL`, `APRA_CLIENT_ID`, `APRA_CLIENT_SECRET`, `APRA_SCOPE`
+Example:
+- `GEG ILS RWY 03 (CAT II - III).kmz`
 
-If none are set, the app falls back to the public NASR download.
+## Session status
 
-You can also enter APRA credentials directly in the app using the **APRA Keys**
-button. These are saved locally in `data/apra_config.json`.
+Bottom status line shows:
+- NASR cycle in use
+- TPP cycle in use
+- APRA credential status
 
-## Output and cache
+## APRA keys
 
-- KMZ files go to the folder you select in the UI.
-- NASR downloads are cached under `data/nasr/`.
+Use `APRA Keys` button in app and save credentials.
+Saved locally in:
+- `data/apra_config.json`
+
+Supported auth styles:
+- API key: `APRA_API_KEY`, `APRA_API_KEY_HEADER`
+- Client headers: `APRA_CLIENT_ID`, `APRA_CLIENT_SECRET` (+ header names)
+- OAuth client credentials: `APRA_TOKEN_URL`, `APRA_CLIENT_ID`, `APRA_CLIENT_SECRET`, optional `APRA_SCOPE`
+
+Default base URL:
+- `https://external-api.faa.gov/apra`
+
+## Caching
+
+- NASR ZIP + parsed cache:
+  - `data/nasr/`
+- TPP bundles + index:
+  - `data/tpp/`
+  - `data/tpp_index.json`
+- Downloaded approach PDFs:
+  - `data/cache/`

@@ -2,10 +2,15 @@
 .venv/
 output/
 data/cache/
+data/charts/
+data/tpp/
+data/tpp_index.json
 data/cycles/
 data/apra_config.json
+data/last_nasr_date.txt
 dist/
 build/
 *.spec
 data/nasr/
+src/data/
 
